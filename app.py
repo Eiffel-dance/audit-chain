@@ -8,8 +8,7 @@ class AuditChain:
     def append(self,tenant,event):
         own=[r for r in self._rows() if r["tenant"]==tenant]; item={"tenant":tenant,"seq":len(own)+1,"event":event,"prev":own[-1]["hash"] if own else "0"*64}; item["hash"]=self._hash(item)
         self.path.parent.mkdir(parents=True,exist_ok=True)
-        with self.path.open("a",encoding="utf-8") as f: f.write(json.dumps(item,sort_keys=True)+"
-")
+        with self.path.open("a",encoding="utf-8") as f: f.write(json.dumps(item,sort_keys=True)+"\n")
         return item
     def verify(self,tenant):
         expected=1; prev="0"*64
@@ -18,3 +17,5 @@ class AuditChain:
             if item["prev"]!=prev or item["hash"]!=self._hash(item): return {"ok":False,"at":expected,"reason":"digest"}
             expected+=1; prev=item["hash"]
         return {"ok":True,"count":expected-1}
+
+
