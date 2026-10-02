@@ -167,7 +167,8 @@ class AuditChain:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _scan(self, tenant, lines, bad_line=None):
+    @staticmethod
+    def _scan(tenant, lines, bad_line=None):
         # Validate the target tenant's chain over the decoded JSONL lines.
         # Returns (verified_count, last_hash). Raises _Broken at the first
         # problem; records of other tenants may interleave and are skipped.
@@ -175,7 +176,10 @@ class AuditChain:
         # verify_all, never host-language loose equality. If bad_line is
         # given, an undecodable physical line follows the lines provided;
         # it is reported as missing only when no earlier problem was found.
-        key = self._tenant_key(tenant)
+        # Pure with respect to the filesystem: callers supply the lines, so
+        # the file-backed methods and the in-memory verify_bytes entry share
+        # this one implementation.
+        key = AuditChain._tenant_key(tenant)
         expected, prev, count = 1, ZERO, 0
         for line, raw in enumerate(lines, 1):
             try:
@@ -184,7 +188,7 @@ class AuditChain:
                 raise _Broken("missing", None, line, expected)
             if not isinstance(item, dict) or "tenant" not in item:
                 raise _Broken("missing", None, line, expected)
-            if self._tenant_key(item["tenant"]) != key:
+            if AuditChain._tenant_key(item["tenant"]) != key:
                 continue
             if any(k not in item for k in FIELDS):
                 seq = item.get("seq")
@@ -194,7 +198,7 @@ class AuditChain:
                 raise _Broken("sequence", expected, line, expected)
             if item["prev"] != prev:
                 raise _Broken("digest", expected, line, expected)
-            if item["hash"] != self._hash(item):
+            if item["hash"] != AuditChain._hash(item):
                 raise _Broken("digest", expected, line, expected)
             count += 1
             prev = item["hash"]
@@ -287,16 +291,16 @@ class AuditChain:
             f.write(block)
             return items
 
-    def verify_all(self):
-        # Validate every tenant chain in one read-only pass over the file, in
-        # physical line order. Each tenant gets an independent expected seq and
-        # prev digest starting at (1, ZERO) on first appearance; records of
-        # different tenants may interleave. The serialized tenant is only an
-        # internal key so distinct types (1 vs "1") stay separate chains while
-        # the original value is reported back unchanged. The shared lease
-        # pins the snapshot to a state wholly before or after any append.
-        data = self._read_snapshot()
-        lines, bad_line = self._decode_lines(data)
+    @staticmethod
+    def _verify_all_snapshot(data):
+        # Pure all-tenant verification of one JSONL byte snapshot: no path,
+        # lock or other I/O. validate each tenant chain in one pass, in
+        # physical line order. Each tenant gets an independent expected seq
+        # and prev digest starting at (1, ZERO) on first appearance; records
+        # of different tenants may interleave. The serialized tenant is only
+        # an internal key so distinct types (1 vs "1") stay separate chains
+        # while the original value is reported back unchanged.
+        lines, bad_line = AuditChain._decode_lines(data)
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
         for line, raw in enumerate(lines, 1):
@@ -309,7 +313,7 @@ class AuditChain:
             tenant = item["tenant"]
             if any(k not in item for k in FIELDS):
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "missing"}
-            key = self._tenant_key(tenant)
+            key = AuditChain._tenant_key(tenant)
             state = states.get(key)
             if state is None:
                 state = [1, ZERO, 0]
@@ -320,7 +324,7 @@ class AuditChain:
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "sequence"}
             if item["prev"] != prev:
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
-            if item["hash"] != self._hash(item):
+            if item["hash"] != AuditChain._hash(item):
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
             state[0] += 1
             state[1] = item["hash"]
@@ -330,6 +334,14 @@ class AuditChain:
             return {"ok": False, "at": bad_line, "tenant": None, "reason": "missing"}
         return {"ok": True,
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
+
+    def verify_all(self):
+        # Validate every tenant chain in one read-only pass over the file. The
+        # scan itself is the pure snapshot core shared with verify_all_bytes;
+        # the shared lease only pins which bytes constitute the snapshot, so
+        # the view is wholly before or after any append, never a partial one.
+        data = self._read_snapshot()
+        return self._verify_all_snapshot(data)
 
     def export_tenant(self, tenant):
         # Offline, single-tenant migration export. Returns UTF-8 bytes only:
@@ -370,6 +382,74 @@ class AuditChain:
                 )
         return b"".join(chunks)
 
+    @staticmethod
+    def _expected_count_verdict(count, expected_count):
+        # Apply the expected_count gate to an already verified chain:
+        # a shortfall is a missing tail, an overshoot a sequence error.
+        if expected_count is not None:
+            if count < expected_count:
+                return {"ok": False, "at": count + 1, "reason": "missing"}
+            if count > expected_count:
+                return {"ok": False, "at": expected_count + 1, "reason": "sequence"}
+        return {"ok": True, "count": count}
+
+    @staticmethod
+    def _verify_tenant_snapshot(data, tenant):
+        # Pure single-tenant verification of one JSONL byte snapshot: no
+        # path, lock or other I/O, and data is only read. The decode/scan
+        # rules are exactly verify's: standard-JSON lines, canonical tenant
+        # identity, sha256 links, first broken point wins (missing / sequence
+        # / digest, at a tenant seq when knowable else the physical line).
+        lines, bad_line = AuditChain._decode_lines(data)
+        try:
+            count, _ = AuditChain._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            return {"ok": False,
+                    "at": b.at if b.at is not None else b.line,
+                    "reason": b.reason}
+        return {"ok": True, "count": count}
+
+    def verify_bytes(self, data, tenant, expected_count=None):
+        # Purely in-memory, offline single-tenant verification. The caller
+        # hands over the raw JSONL bytes directly; the path this chain was
+        # constructed with is never read, created or modified, and data is
+        # not mutated. A single-tenant export and a full log with interleaved
+        # tenants both validate, under the same standard-JSON, tenant
+        # identity and digest rules as verify, whose verdict shape this
+        # returns exactly.
+        if not isinstance(data, bytes):
+            raise ValueError(
+                f"data must be bytes, got {type(data).__name__}"
+            )
+        # Tenant crosses the standard-JSON boundary exactly as in verify;
+        # ValueError is raised before the snapshot is inspected, so no
+        # underlying json/recursion error can leak.
+        _validate_json_value(tenant)
+        if expected_count is not None and (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count < 0
+        ):
+            raise ValueError(
+                "expected_count must be a non-negative integer or None"
+            )
+        result = self._verify_tenant_snapshot(data, tenant)
+        if not result["ok"]:
+            return result
+        return self._expected_count_verdict(result["count"], expected_count)
+
+    def verify_all_bytes(self, data):
+        # Purely in-memory, offline all-tenant verification. The bytes are the
+        # whole snapshot: tenants, counts, order and the first-error structure
+        # are exactly verify_all's. Empty bytes are a successful empty history
+        # and create no file. The constructor path is never touched and data
+        # is only read.
+        if not isinstance(data, bytes):
+            raise ValueError(
+                f"data must be bytes, got {type(data).__name__}"
+            )
+        return self._verify_all_snapshot(data)
+
     def verify(self, tenant, expected_count=None):
         # The tenant crosses the same standard-JSON input boundary as in
         # append/append_batch, and it is checked before any history is read:
@@ -381,14 +461,7 @@ class AuditChain:
         # every byte untouched and creates nothing.
         _validate_json_value(tenant)
         data = self._read_snapshot()
-        lines, bad_line = self._decode_lines(data)
-        try:
-            count, _ = self._scan(tenant, lines, bad_line)
-        except _Broken as b:
-            return {"ok": False, "at": b.at if b.at is not None else b.line, "reason": b.reason}
-        if expected_count is not None:
-            if count < expected_count:
-                return {"ok": False, "at": count + 1, "reason": "missing"}
-            if count > expected_count:
-                return {"ok": False, "at": expected_count + 1, "reason": "sequence"}
-        return {"ok": True, "count": count}
+        result = self._verify_tenant_snapshot(data, tenant)
+        if not result["ok"]:
+            return result
+        return self._expected_count_verdict(result["count"], expected_count)
