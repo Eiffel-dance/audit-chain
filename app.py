@@ -331,6 +331,45 @@ class AuditChain:
         return {"ok": True,
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
 
+    def export_tenant(self, tenant):
+        # Offline, single-tenant migration export. Returns UTF-8 bytes only:
+        # it never creates, mutates or deletes any path and never touches the
+        # network. The tenant crosses the same standard-JSON input boundary as
+        # append/verify, and, like verify, it is checked before any history is
+        # read, so an illegal value raises ValueError without a single byte
+        # being read or created.
+        _validate_json_value(tenant)
+        # One shared-lease snapshot pins the whole export to a state wholly
+        # before or after some append: a concurrent writer can never land in
+        # the middle of it. Nothing is assembled into a result until the exact
+        # scan verify(tenant) runs has cleared the complete snapshot, so a
+        # corrupt source raises AuditChainStateError instead of returning the
+        # verified prefix. A missing or empty file is a legitimate empty
+        # snapshot and yields b"".
+        data = self._read_snapshot()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # The full snapshot is valid for this tenant; only now collect its
+        # records in physical order, dropping every interleaved tenant. Each
+        # record is re-emitted with the exact serialization and newline rule
+        # append uses, so the bytes a caller drops at a new JSONL path verify
+        # offline with unchanged seq/prev/hash semantics; distinct JSON tenant
+        # identities never share an export.
+        key = self._tenant_key(tenant)
+        chunks = []
+        for raw in lines:
+            item = _strict_loads(raw)
+            if self._tenant_key(item["tenant"]) == key:
+                chunks.append(
+                    (json.dumps(item, sort_keys=True, allow_nan=False) + "\n")
+                    .encode("utf-8")
+                )
+        return b"".join(chunks)
+
     def verify(self, tenant, expected_count=None):
         # The tenant crosses the same standard-JSON input boundary as in
         # append/append_batch, and it is checked before any history is read:
