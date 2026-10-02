@@ -470,15 +470,20 @@ class AuditChain:
         return {"ok": True, "count": count}
 
     def verify(self, tenant, expected_count=None):
-        # The tenant crosses the same standard-JSON input boundary as in
-        # append/append_batch, and it is checked before any history is read:
-        # NaN/Infinity/-Infinity, non-string object keys, cyclic containers
-        # and values without a standard JSON encoding raise ValueError here,
-        # never TypeError/RecursionError from a downstream json.dumps, and
-        # never a verdict computed against a corrupt or missing file. The
-        # file itself is opened read-only below, so a rejected call leaves
-        # every byte untouched and creates nothing.
+        # Both arguments cross their boundary before any history is read, in
+        # the exact order verify_bytes uses: the tenant first (same standard-
+        # JSON input boundary as in append/append_batch: NaN/Infinity/
+        # -Infinity, non-string object keys, cyclic containers and values
+        # without a standard JSON encoding raise ValueError here, never
+        # TypeError/RecursionError from a downstream json.dumps), then
+        # expected_count, which must be None or a non-negative plain int
+        # (bool is rejected even though it subclasses int; floats, strings
+        # and other types are too). Both raise before the file is opened, so
+        # a rejected call never sees a verdict computed against a corrupt or
+        # missing file, leaves every byte untouched and creates nothing --
+        # the file below is opened read-only regardless.
         _validate_json_value(tenant)
+        _validate_expected_count(expected_count)
         return self._verify_snapshot(
             tenant, self._read_snapshot(), expected_count
         )
