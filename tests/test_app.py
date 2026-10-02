@@ -287,6 +287,62 @@ class AuditChainTest(unittest.TestCase):
         self.assertEqual(r, {"ok": False, "at": 1, "tenant": "t", "reason": "digest"})
         self.assertEqual(self.read(), before)  # read-only, no side effects
 
+    # --- tenant identity: canonical JSON data identity, not loose equality ---
+
+    def test_numeric_and_string_identities_stay_distinct(self):
+        for t in (1, 1.0, True, "1"):
+            item = self.chain.append(t, {})
+            self.assertEqual((item["seq"], item["prev"]), (1, ZERO))
+        for t in (1, 1.0, True, "1"):
+            self.assertEqual(self.chain.verify(t), {"ok": True, "count": 1})
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": True, "tenants": [
+            {"tenant": 1, "count": 1},
+            {"tenant": 1.0, "count": 1},
+            {"tenant": True, "count": 1},
+            {"tenant": "1", "count": 1},
+        ]})
+
+    def test_append_does_not_continue_other_numeric_identity(self):
+        self.chain.append(1, {})
+        self.chain.append(1, {})
+        item = self.chain.append(1.0, {})  # must not continue tenant 1's chain
+        self.assertEqual((item["seq"], item["prev"]), (1, ZERO))
+        self.assertEqual(self.chain.verify(1), {"ok": True, "count": 2})
+        self.assertEqual(self.chain.verify(1.0), {"ok": True, "count": 1})
+
+    def test_object_tenant_key_order_is_irrelevant(self):
+        a = self.chain.append({"b": 1, "a": 2}, {})
+        b = self.chain.append({"a": 2, "b": 1}, {})  # same identity, continues
+        self.assertEqual((b["seq"], b["prev"]), (2, a["hash"]))
+        self.assertEqual(self.chain.verify({"a": 2, "b": 1}), {"ok": True, "count": 2})
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": True, "tenants": [
+            {"tenant": {"b": 1, "a": 2}, "count": 2},
+        ]})
+
+    def test_confused_history_reports_first_sequence_error(self):
+        # legacy file written under loose-equality identity: tenant 1 took
+        # seq 1, so 1.0's own records begin at seq 2
+        one = {"tenant": 1, "seq": 1, "event": {}, "prev": ZERO}
+        one["hash"] = AuditChain._hash(one)
+        confused = {"tenant": 1.0, "seq": 2, "event": {}, "prev": one["hash"]}
+        confused["hash"] = AuditChain._hash(confused)
+        self.write([one, confused])
+        r = self.chain.verify(1.0)
+        self.assertEqual((r["ok"], r["at"], r["reason"]), (False, 1, "sequence"))
+        self.assertEqual(self.chain.verify(1), {"ok": True, "count": 1})
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 2, "tenant": 1.0, "reason": "sequence"})
+        before = self.read()
+        with self.assertRaises(AuditChainStateError) as cm:
+            self.chain.append(1.0, {})
+        self.assertEqual(cm.exception.tenant, 1.0)
+        self.assertEqual(cm.exception.seq, 1)
+        self.assertEqual(cm.exception.reason, "sequence")
+        self.assertEqual(cm.exception.line, 2)
+        self.assertEqual(self.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

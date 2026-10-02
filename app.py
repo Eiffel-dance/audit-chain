@@ -32,6 +32,14 @@ class AuditChain:
         return self.path.read_text(encoding="utf-8") if self.path.exists() else ""
 
     @staticmethod
+    def _tenant_key(tenant):
+        # Stable JSON data identity for partition semantics: canonical
+        # serialization makes object key order irrelevant, while distinct
+        # types or numeric spellings (1 vs 1.0 vs true vs "1") stay
+        # independent chains regardless of host-language loose equality.
+        return json.dumps(tenant, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
     def _hash(item):
         payload = json.dumps(
             {k: item[k] for k in ("tenant", "seq", "event", "prev")},
@@ -43,6 +51,9 @@ class AuditChain:
         # Validate the target tenant's chain over the whole UTF-8 JSONL file.
         # Returns (verified_count, last_hash). Raises _Broken at the first
         # problem; records of other tenants may interleave and are skipped.
+        # Identity uses the canonical JSON key, never ==, so 1, 1.0, true
+        # and "1" can never share a chain.
+        key = self._tenant_key(tenant)
         expected, prev, count = 1, ZERO, 0
         for line, raw in enumerate(text.splitlines(), 1):
             try:
@@ -51,7 +62,7 @@ class AuditChain:
                 raise _Broken("missing", None, line, expected)
             if not isinstance(item, dict) or "tenant" not in item:
                 raise _Broken("missing", None, line, expected)
-            if item["tenant"] != tenant:
+            if self._tenant_key(item["tenant"]) != key:
                 continue
             if any(k not in item for k in FIELDS):
                 seq = item.get("seq")
@@ -87,10 +98,11 @@ class AuditChain:
         # Validate every tenant chain in one read-only pass over the file, in
         # physical line order. Each tenant gets an independent expected seq and
         # prev digest starting at (1, ZERO) on first appearance; records of
-        # different tenants may interleave. The serialized tenant is only an
-        # internal key so distinct types (1 vs "1") stay separate chains while
-        # the original value is reported back unchanged.
-        states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
+        # different tenants may interleave. Partitioning uses the same
+        # canonical JSON identity as append/verify, so distinct types
+        # (1 vs 1.0 vs true vs "1") stay separate chains while the original
+        # value is reported back unchanged.
+        states = {}  # canonical tenant key -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
         for line, raw in enumerate(self._read().splitlines(), 1):
             try:
@@ -102,7 +114,7 @@ class AuditChain:
             tenant = item["tenant"]
             if any(k not in item for k in FIELDS):
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "missing"}
-            key = json.dumps(tenant, sort_keys=True, separators=(",", ":"))
+            key = self._tenant_key(tenant)
             state = states.get(key)
             if state is None:
                 state = [1, ZERO, 0]
