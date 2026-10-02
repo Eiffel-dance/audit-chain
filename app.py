@@ -1,8 +1,67 @@
-import hashlib, json
+import hashlib, json, math
 from pathlib import Path
 
 ZERO = "0" * 64
 FIELDS = ("tenant", "seq", "event", "prev", "hash")
+
+
+def _validate_json_value(value, _stack=()):
+    # Standard-JSON input boundary: only null, bool, finite int, finite
+    # float, str, array (list) and object (dict with str keys) may cross
+    # it, recursively. NaN/Infinity/-Infinity, non-string object keys and
+    # anything without an unambiguous standard JSON encoding (including
+    # cyclic containers) are rejected with ValueError.
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite number is not standard JSON: {value!r}")
+        return
+    if isinstance(value, (list, dict)):
+        if id(value) in _stack:
+            raise ValueError("cyclic container cannot be encoded as standard JSON")
+        stack = _stack + (id(value),)
+        if isinstance(value, list):
+            for item in value:
+                _validate_json_value(item, stack)
+        else:
+            for k, v in value.items():
+                if not isinstance(k, str):
+                    raise ValueError(f"non-string object key is not standard JSON: {k!r}")
+                _validate_json_value(v, stack)
+        return
+    raise ValueError(f"value has no standard JSON encoding: {value!r}")
+
+
+def _strict_loads(raw):
+    # Parse one physical line as standard JSON only. Python's json is
+    # otherwise lenient: it accepts NaN/Infinity/-Infinity literals,
+    # silently keeps the last of duplicate object keys, and parses
+    # overflowing numbers like 1e999 as inf. All of these are rejected
+    # here so a non-standard line surfaces as a parse failure.
+    def reject_constant(name):
+        raise ValueError(f"non-standard JSON constant: {name}")
+
+    def reject_non_finite(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite JSON number: {text}")
+        return value
+
+    def object_no_duplicate_keys(pairs):
+        obj = {}
+        for k, v in pairs:
+            if k in obj:
+                raise ValueError(f"duplicate object key: {k!r}")
+            obj[k] = v
+        return obj
+
+    return json.loads(
+        raw,
+        parse_constant=reject_constant,
+        parse_float=reject_non_finite,
+        object_pairs_hook=object_no_duplicate_keys,
+    )
 
 
 class AuditChainStateError(Exception):
@@ -80,7 +139,7 @@ class AuditChain:
         expected, prev, count = 1, ZERO, 0
         for line, raw in enumerate(lines, 1):
             try:
-                item = json.loads(raw)
+                item = _strict_loads(raw)
             except Exception:
                 raise _Broken("missing", None, line, expected)
             if not isinstance(item, dict) or "tenant" not in item:
@@ -105,6 +164,12 @@ class AuditChain:
         return count, prev
 
     def append(self, tenant, event):
+        # Validate the new input against the standard-JSON boundary before
+        # anything else: an illegal tenant/event raises ValueError without
+        # reading history or writing a single byte, and takes priority over
+        # any append action (including corrupt-history rejection).
+        _validate_json_value(tenant)
+        _validate_json_value(event)
         data = self._read_bytes()
         lines, bad_line = self._decode_lines(data)
         try:
@@ -117,7 +182,7 @@ class AuditChain:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         prefix = b"" if not data or data.endswith(b"\n") else b"\n"
         with self.path.open("ab") as f:
-            f.write(prefix + (json.dumps(item, sort_keys=True) + "\n").encode("utf-8"))
+            f.write(prefix + (json.dumps(item, sort_keys=True, allow_nan=False) + "\n").encode("utf-8"))
         return item
 
     def verify_all(self):
@@ -132,7 +197,7 @@ class AuditChain:
         lines, bad_line = self._decode_lines(self._read_bytes())
         for line, raw in enumerate(lines, 1):
             try:
-                item = json.loads(raw)
+                item = _strict_loads(raw)
             except Exception:
                 return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
             if not isinstance(item, dict) or "tenant" not in item:
