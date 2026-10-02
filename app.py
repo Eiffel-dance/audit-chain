@@ -332,6 +332,14 @@ class AuditChain:
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
 
     def verify(self, tenant, expected_count=None):
+        # The read entry point uses exactly the standard-JSON tenant
+        # definition that append does: validate before reading history or
+        # touching any path, so NaN/Infinity/-Infinity can never serve as a
+        # tenant partition and non-string keys, cyclic containers or other
+        # unencodable values surface as ValueError rather than TypeError,
+        # RecursionError or a JSON encoding error. This also wins over
+        # corrupt history, which stays byte-for-byte untouched.
+        _validate_json_value(tenant)
         data = self._read_snapshot()
         lines, bad_line = self._decode_lines(data)
         try:
