@@ -83,6 +83,27 @@ def _validate_expected_count(expected_count):
         )
 
 
+def _validate_page_params(start_seq, page_size):
+    # Pagination boundary for read_tenant: start_seq must be a plain int >= 1
+    # and page_size must be a plain int >= 1 or None (read through the chain
+    # tail). As everywhere else, bool is rejected despite being an int
+    # subclass, and floats such as 1.0 are not accepted as integers.
+    if isinstance(start_seq, bool) or not isinstance(start_seq, int) \
+            or start_seq < 1:
+        raise ValueError(
+            "start_seq must be an integer >= 1, got "
+            f"{start_seq!r}"
+        )
+    if page_size is not None and (
+        isinstance(page_size, bool) or not isinstance(page_size, int)
+        or page_size < 1
+    ):
+        raise ValueError(
+            "page_size must be a positive integer or None, got "
+            f"{page_size!r}"
+        )
+
+
 class AuditChainStateError(Exception):
     def __init__(self, tenant, seq, reason=None, line=None):
         self.tenant = tenant
@@ -390,6 +411,48 @@ class AuditChain:
                     .encode("utf-8")
                 )
         return b"".join(chunks)
+
+    def read_tenant(self, tenant, start_seq=1, page_size=None):
+        # Read-only, paginated single-tenant read. Returns the records of the
+        # target tenant ordered by ascending seq -- each record is the same
+        # five-field object (tenant, seq, event, prev, hash) with the same
+        # values append wrote -- sliced to [start_seq, start_seq + page_size).
+        # Interleaved records of other tenants never change the order or the
+        # page contents. Like verify/export, the tenant crosses the standard-
+        # JSON boundary and the pagination args are checked before any history
+        # is read, so NaN/Infinity, non-string keys, cyclic containers, bool
+        # and non-integer pagination values raise ValueError without reading,
+        # creating or modifying a single byte.
+        _validate_json_value(tenant)
+        _validate_page_params(start_seq, page_size)
+        # One shared-lease snapshot pins the whole read exactly as for verify
+        # and export: a concurrent append is visible only as the complete
+        # state before it or the complete state after it, never as a torn
+        # prefix. The full scan verify(tenant) runs clears the whole snapshot
+        # before any record is collected, so corruption raises
+        # AuditChainStateError (same tenant/seq/reason/line as verify, append
+        # and export_tenant) instead of returning a verified prefix. A
+        # missing or empty file, or a tenant that never appears, is a
+        # legitimate empty chain and yields [].
+        data = self._read_snapshot()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # The snapshot is valid for this tenant; collect its records in
+        # physical order (which is ascending seq for the tenant) and slice the
+        # requested page. A start beyond the current count is an empty page,
+        # and a short tail never raises: page_size is a maximum.
+        key = self._tenant_key(tenant)
+        records = []
+        for raw in lines:
+            item = _strict_loads(raw)
+            if self._tenant_key(item["tenant"]) == key:
+                records.append({k: item[k] for k in FIELDS})
+        end = None if page_size is None else start_seq - 1 + page_size
+        return records[start_seq - 1:end]
 
     def _verify_snapshot(self, tenant, data, expected_count=None):
         # Core of verify over an exact in-memory snapshot: the same JSON
