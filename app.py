@@ -203,6 +203,43 @@ class AuditChain:
             raise _Broken("missing", None, bad_line, expected)
         return count, prev
 
+    def _commit(self, f, tenant, events):
+        # The locked core shared by append and append_batch: read the latest
+        # complete history, validate the tenant chain, then append every event
+        # as one contiguous run. Called only while the caller holds an
+        # exclusive lease on f, so competing appends (single or batch)
+        # serialize against the whole run: another append to the same tenant
+        # can land only wholly before or wholly after it, never between two
+        # records of the batch. Returns the built records in input order; the
+        # bytes written are identical to issuing one append per event with no
+        # concurrency in between.
+        data = f.read()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            count, prev = self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        items = []
+        blob = bytearray()
+        if data and not data.endswith(b"\n"):
+            blob += b"\n"
+        for event in events:
+            item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": prev}
+            item["hash"] = self._hash(item)
+            blob += (
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            ).encode("utf-8")
+            items.append(item)
+            count += 1
+            prev = item["hash"]
+        # A single write places the whole batch at the current end of the
+        # file; under the exclusive lease no other writer moves that end and
+        # no existing byte can be overwritten. Readers take a shared lease, so
+        # they can observe the history only before or after the entire run.
+        f.write(blob)
+        return items
+
     def append(self, tenant, event):
         # Validate the new input against the standard-JSON boundary before
         # anything else: an illegal tenant/event raises ValueError without
@@ -218,24 +255,30 @@ class AuditChain:
             # computed from the latest complete state right before its own
             # bytes hit disk: competing appends serialize here and each
             # observes the previous winner's record already on disk.
-            data = f.read()
-            lines, bad_line = self._decode_lines(data)
-            try:
-                count, prev = self._scan(tenant, lines, bad_line)
-            except _Broken as b:
-                seq = b.at if b.at is not None else b.expect
-                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
-            item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": prev}
-            item["hash"] = self._hash(item)
-            # One O_APPEND write places the whole record atomically at the
-            # current end of the file; under the exclusive lease no other
-            # writer moves that end, and no existing byte can be overwritten.
-            prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
-            record = prefix + (
-                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
-            ).encode("utf-8")
-            f.write(record)
-            return item
+            return self._commit(f, tenant, [event])[0]
+
+    def append_batch(self, tenant, events):
+        # Append one tenant's events as a single indivisible run. The same
+        # standard-JSON boundary as append applies to tenant and to every
+        # event, and events itself must be exactly a list (not a tuple or any
+        # other iterable). All validation runs before the lease is taken, so
+        # any ValueError surfaces without creating the file or touching a
+        # byte, independently of lock contention.
+        _validate_json_value(tenant)
+        if not isinstance(events, list):
+            raise ValueError(f"events must be a list: {events!r}")
+        for event in events:
+            _validate_json_value(event)
+        if not events:
+            # An empty batch is a pure no-op: return [] without taking the
+            # lease, so the path is never created and existing bytes (or the
+            # absence of the file) are left exactly as found.
+            return []
+        with self._write_lease() as f:
+            # One lease covers the scan and the whole run, so the batch's
+            # first seq/prev are computed from the last committed record and
+            # the entire interval becomes visible as one indivisible result.
+            return self._commit(f, tenant, events)
 
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
