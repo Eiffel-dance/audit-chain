@@ -287,6 +287,70 @@ class AuditChainTest(unittest.TestCase):
         self.assertEqual(r, {"ok": False, "at": 1, "tenant": "t", "reason": "digest"})
         self.assertEqual(self.read(), before)  # read-only, no side effects
 
+    # --- tenant identity: canonical JSON data identity, not loose equality ---
+
+    def test_numeric_bool_string_tenants_are_independent_chains(self):
+        # 1, 1.0, true and "1" must not share a chain under loose equality.
+        for t in (1, 1.0, True, "1"):
+            item = self.chain.append(t, {})
+            self.assertEqual(item["seq"], 1)
+            self.assertEqual(item["prev"], ZERO)
+        for t in (1, 1.0, True, "1"):
+            self.assertEqual(self.chain.verify(t), {"ok": True, "count": 1})
+            item = self.chain.append(t, {})
+            self.assertEqual(item["seq"], 2)
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": True, "tenants": [
+            {"tenant": 1, "count": 2},
+            {"tenant": 1.0, "count": 2},
+            {"tenant": True, "count": 2},
+            {"tenant": "1", "count": 2},
+        ]})
+
+    def test_object_tenant_key_order_is_same_identity(self):
+        a = self.chain.append({"a": 1, "b": 2}, {})
+        b = self.chain.append({"b": 2, "a": 1}, {})
+        self.assertEqual(b["seq"], 2)
+        self.assertEqual(b["prev"], a["hash"])
+        self.assertEqual(self.chain.verify({"b": 2, "a": 1}), {"ok": True, "count": 2})
+        # nested objects normalize too, but different values stay distinct
+        c = self.chain.append({"a": 1, "b": 3}, {})
+        self.assertEqual(c["seq"], 1)
+
+    def test_legacy_confused_chain_reports_first_sequence_error(self):
+        # File written under loose-equality semantics: tenant 1 at seq 1,
+        # then 1.0 continuing at seq 2. Under JSON identity, 1.0's first
+        # record is a sequence error; nothing is reordered or repaired.
+        one = {"tenant": 1, "seq": 1, "event": {}, "prev": ZERO}
+        one["hash"] = AuditChain._hash(one)
+        confused = {"tenant": 1.0, "seq": 2, "event": {}, "prev": one["hash"]}
+        confused["hash"] = AuditChain._hash(confused)
+        self.write([one, confused])
+        before = self.read()
+        r = self.chain.verify(1.0)
+        self.assertEqual((r["ok"], r["at"], r["reason"]), (False, 1, "sequence"))
+        self.assertEqual(self.chain.verify(1), {"ok": True, "count": 1})
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 2, "tenant": 1.0, "reason": "sequence"})
+        self.assertEqual(self.read(), before)
+        # append to the confused identity must refuse and keep bytes intact
+        with self.assertRaises(AuditChainStateError) as cm:
+            self.chain.append(1.0, {})
+        self.assertEqual((cm.exception.tenant, cm.exception.seq, cm.exception.reason),
+                         (1.0, 1, "sequence"))
+        self.assertEqual(self.read(), before)
+        # the unaffected identity still appends on its own chain
+        item = self.chain.append(1, {})
+        self.assertEqual(item["seq"], 2)
+
+    def test_true_and_one_do_not_share_history(self):
+        self.chain.append(1, {})
+        item = self.chain.append(True, {})
+        self.assertEqual(item["seq"], 1)
+        self.assertEqual(item["prev"], ZERO)
+        self.assertEqual(self.chain.verify(True), {"ok": True, "count": 1})
+        self.assertEqual(self.chain.verify(1), {"ok": True, "count": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

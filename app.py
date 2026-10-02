@@ -32,6 +32,14 @@ class AuditChain:
         return self.path.read_text(encoding="utf-8") if self.path.exists() else ""
 
     @staticmethod
+    def _tenant_key(tenant):
+        # Canonical JSON data identity of a tenant value. Object key order is
+        # normalized away, while distinct JSON types or number spellings stay
+        # distinct partitions: 1, 1.0, true and "1" are four different
+        # tenants regardless of host-language loose equality.
+        return json.dumps(tenant, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
     def _hash(item):
         payload = json.dumps(
             {k: item[k] for k in ("tenant", "seq", "event", "prev")},
@@ -43,6 +51,9 @@ class AuditChain:
         # Validate the target tenant's chain over the whole UTF-8 JSONL file.
         # Returns (verified_count, last_hash). Raises _Broken at the first
         # problem; records of other tenants may interleave and are skipped.
+        # Tenant matching uses the same canonical JSON identity as
+        # verify_all, never host-language loose equality.
+        key = self._tenant_key(tenant)
         expected, prev, count = 1, ZERO, 0
         for line, raw in enumerate(text.splitlines(), 1):
             try:
@@ -51,7 +62,7 @@ class AuditChain:
                 raise _Broken("missing", None, line, expected)
             if not isinstance(item, dict) or "tenant" not in item:
                 raise _Broken("missing", None, line, expected)
-            if item["tenant"] != tenant:
+            if self._tenant_key(item["tenant"]) != key:
                 continue
             if any(k not in item for k in FIELDS):
                 seq = item.get("seq")
@@ -102,7 +113,7 @@ class AuditChain:
             tenant = item["tenant"]
             if any(k not in item for k in FIELDS):
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "missing"}
-            key = json.dumps(tenant, sort_keys=True, separators=(",", ":"))
+            key = self._tenant_key(tenant)
             state = states.get(key)
             if state is None:
                 state = [1, ZERO, 0]
