@@ -237,6 +237,56 @@ class AuditChain:
             f.write(record)
             return item
 
+    def append_batch(self, tenant, events):
+        # Append a group of same-tenant events as one verifiable interval.
+        # events must be a list (a bare JSON value, including a string, is
+        # not a batch); the tenant and every event cross the same standard-
+        # JSON boundary as in append. All of this is checked before taking
+        # the lease, so a malformed call raises ValueError without reading
+        # history or creating the file, under any contention. An empty list
+        # is a no-op: nothing is created and no existing byte is touched.
+        if not isinstance(events, list):
+            raise ValueError(
+                f"events must be a list, got {type(events).__name__}"
+            )
+        _validate_json_value(tenant)
+        for event in events:
+            _validate_json_value(event)
+        if not events:
+            return []
+        with self._write_lease() as f:
+            # One lease covers the whole read-build-append interval, so the
+            # batch is an indivisible result for competing writers: their
+            # records serialize wholly before or wholly after these, never
+            # between two of its records. The records are emitted as one
+            # byte block at the current end of file, so readers under the
+            # shared lease likewise see either the whole batch or none of
+            # it. The first record continues the tenant chain found on disk;
+            # each later record links to the previous record of the batch.
+            data = f.read()
+            lines, bad_line = self._decode_lines(data)
+            try:
+                count, prev = self._scan(tenant, lines, bad_line)
+            except _Broken as b:
+                seq = b.at if b.at is not None else b.expect
+                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+            items = []
+            chunks = []
+            for event in events:
+                item = {"tenant": tenant, "seq": count + 1,
+                        "event": event, "prev": prev}
+                item["hash"] = self._hash(item)
+                items.append(item)
+                chunks.append(
+                    json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                )
+                count += 1
+                prev = item["hash"]
+            prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+            block = prefix + "".join(chunks).encode("utf-8")
+            f.write(block)
+            return items
+
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
         # physical line order. Each tenant gets an independent expected seq and
