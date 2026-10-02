@@ -68,6 +68,48 @@ class AuditChain:
             expected += 1
         return count, prev
 
+    @staticmethod
+    def _tenant_key(tenant):
+        # Canonical key so values that differ only in type stay distinct
+        # (e.g. 1 vs "1", True vs 1) and unhashable JSON values still work.
+        return json.dumps(tenant, sort_keys=True)
+
+    def verify_all(self):
+        # Validate every tenant partition in one physical-line pass. Each
+        # tenant gets its own expected seq / previous digest, seeded on first
+        # appearance; records of different tenants may interleave. Read-only:
+        # a missing path is treated as an empty file.
+        state = {}  # tenant key -> [expected_seq, prev_digest, count]
+        order = []  # first-appearance order: (tenant key, tenant value)
+        for line, raw in enumerate(self._read().splitlines(), 1):
+            try:
+                item = json.loads(raw)
+            except Exception:
+                return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
+            if not isinstance(item, dict) or "tenant" not in item:
+                return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            if any(k not in item for k in FIELDS):
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "missing"}
+            if key not in state:
+                state[key] = [1, ZERO, 0]
+                order.append((key, tenant))
+            expected, prev, count = state[key]
+            if isinstance(item["seq"], bool) or item["seq"] != expected:
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "sequence"}
+            if item["prev"] != prev:
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
+            if item["hash"] != self._hash(item):
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
+            state[key] = [expected + 1, item["hash"], count + 1]
+        return {
+            "ok": True,
+            "tenants": [
+                {"tenant": tenant, "count": state[key][2]} for key, tenant in order
+            ],
+        }
+
     def append(self, tenant, event):
         text = self._read()
         try:
