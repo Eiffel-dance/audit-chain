@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 ZERO = "0" * 64
@@ -83,6 +84,30 @@ def _validate_expected_count(expected_count):
         )
 
 
+def _validate_required_count(expected_count):
+    # append_if_head's head assertion carries a mandatory count: a
+    # non-negative plain int, never None. bool is rejected even though it
+    # subclasses int; floats, strings and other types are too.
+    if isinstance(expected_count, bool) or not isinstance(expected_count, int) \
+            or expected_count < 0:
+        raise ValueError(
+            "expected_count must be a non-negative integer, got "
+            f"{expected_count!r}"
+        )
+
+
+def _validate_expected_hash(expected_hash):
+    # The asserted chain-head digest is exactly 64 lowercase hex characters;
+    # an empty chain is asserted with the module ZERO. Uppercase, the wrong
+    # length or any other type/shape are caller errors, not chain conflicts.
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64 \
+            or any(c not in "0123456789abcdef" for c in expected_hash):
+        raise ValueError(
+            "expected_hash must be 64 lowercase hexadecimal characters, got "
+            f"{expected_hash!r}"
+        )
+
+
 class AuditChainStateError(Exception):
     def __init__(self, tenant, seq, reason=None, line=None):
         self.tenant = tenant
@@ -91,6 +116,26 @@ class AuditChainStateError(Exception):
         self.line = line
         detail = f" (line {line})" if line is not None else ""
         super().__init__(f"invalid audit chain state for tenant {tenant!r} at seq {seq}{detail}")
+
+
+class AuditChainConflictError(Exception):
+    # A syntactically valid head assertion that does not match the chain
+    # tail observed inside the lease. reason is fixed; the five fields let
+    # a caller distinguish a stale/wrong-count expectation from a
+    # stale/wrong-hash one without re-reading the log.
+    def __init__(self, tenant, expected_count, expected_hash,
+                 actual_count, actual_hash):
+        self.tenant = tenant
+        self.expected_count = expected_count
+        self.expected_hash = expected_hash
+        self.actual_count = actual_count
+        self.actual_hash = actual_hash
+        self.reason = "conflict"
+        super().__init__(
+            f"audit chain head conflict for tenant {tenant!r}: "
+            f"expected count={expected_count} hash={expected_hash}, "
+            f"actual count={actual_count} hash={actual_hash}"
+        )
 
 
 class _Broken(Exception):
@@ -107,6 +152,21 @@ class AuditChain:
         self.path = Path(path)
 
     @contextlib.contextmanager
+    def _dir_lease(self):
+        # Auxiliary exclusive lease on the containing directory itself. It
+        # never carries data bytes; its only job is to make the moment a data
+        # file first appears indivisible relative to a conditional append
+        # that is allowed to create the file only on its winning branch.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        dfd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            fcntl.flock(dfd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(dfd, fcntl.LOCK_UN)
+            os.close(dfd)
+
+    @contextlib.contextmanager
     def _write_lease(self):
         # Exclusive lease for one read-modify-append. The same open file
         # description carries the lock, the history read and the final append:
@@ -114,8 +174,14 @@ class AuditChain:
         # lost to a second open of the path, and the bytes appended are the
         # ones computed from the bytes just read. A fresh fd per call makes
         # flock genuinely exclude both other processes and other threads.
+        # The creating open happens inside the directory lease, so a
+        # conditional append probing a not-yet-existing path cannot race the
+        # file's first appearance (see append_if_head); the lease is released
+        # again before blocking on the data file, so it never serializes
+        # unrelated chains in the same directory for a write's duration.
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        f = open(self.path, "a+b")
+        with self._dir_lease():
+            f = open(self.path, "a+b")
         try:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             f.seek(0)
@@ -301,6 +367,95 @@ class AuditChain:
             block = prefix + "".join(chunks).encode("utf-8")
             f.write(block)
             return items
+
+    def _append_if_head_locked(self, f, tenant, event,
+                               expected_count, expected_hash):
+        # Scan, compare and append on a description already holding the
+        # exclusive data-file lease. A corrupt history is reported exactly as
+        # append reports it and the assertion is never evaluated against an
+        # unverifiable chain; a well-formed but mismatching head is a conflict.
+        # Nothing is written on either failure path.
+        data = f.read()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            count, head = self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # _scan returns ZERO for an empty chain, so an empty history is
+        # compared by the exact same rule as a non-empty one: the call
+        # proceeds only when both the length and the tail digest match.
+        if count != expected_count or head != expected_hash:
+            raise AuditChainConflictError(
+                tenant, expected_count, expected_hash, count, head
+            )
+        # Head confirmed. The record uses the identical fields, seq numbering,
+        # prev digest and hash algorithm as append.
+        item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": head}
+        item["hash"] = self._hash(item)
+        # One O_APPEND write places the whole record atomically at the
+        # current end of file; under the exclusive lease no other writer
+        # moves that end, and no existing byte can be overwritten.
+        prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+        record = prefix + (
+            json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        f.write(record)
+        return item
+
+    def append_if_head(self, tenant, event, expected_count, expected_hash):
+        # Conditional append behind an optimistic head assertion. Every input
+        # crosses its boundary before a lease is taken, a path is probed or a
+        # single byte is read: tenant/event use the same standard-JSON
+        # boundary as append, expected_count must be a non-negative plain int
+        # (bool, negative, float and other types are ValueError), and
+        # expected_hash must be exactly the 64 lowercase hex characters of a
+        # sha256 digest (the empty-chain head is asserted with ZERO). A
+        # malformed call ends here, creates nothing and never depends on
+        # contention or history.
+        _validate_json_value(tenant)
+        _validate_json_value(event)
+        _validate_required_count(expected_count)
+        _validate_expected_hash(expected_hash)
+        # One exclusive lease covers validation-read, comparison and the
+        # write. On an existing log that is the ordinary data-file lease;
+        # before the log exists, the data-file lock cannot be taken without
+        # creating the path (and a losing assertion must leave no file), so
+        # the directory lease -- the same one ordinary appends hold while
+        # creating the file -- guards the whole missing-file branch. The
+        # existence probe, the empty-chain comparison and a winning creation
+        # are therefore indivisible relative to every other writer. Lock
+        # order is always directory-then-data, so the nesting cannot
+        # deadlock against a plain append. _dir_lease also ensures the
+        # parent directory exists.
+        with self._dir_lease():
+            try:
+                f = open(self.path, "r+b")
+            except FileNotFoundError:
+                # Definitive empty chain for every tenant: no other writer
+                # can create the path while this lease is held. A non-empty
+                # assertion is a deterministic conflict and must not create
+                # the log; only an exact (0, ZERO) assertion may.
+                if expected_count != 0 or expected_hash != ZERO:
+                    raise AuditChainConflictError(
+                        tenant, expected_count, expected_hash, 0, ZERO
+                    )
+                f = open(self.path, "a+b")
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                # When the file existed, assertions against the same head
+                # serialize here: one appends and observes (count, head),
+                # every other observes the winner's new tail and gets the
+                # conflict with the actual values, no byte written by a
+                # losing call. When this call just created the file the scan
+                # confirms the empty head it was allowed to create for.
+                return self._append_if_head_locked(
+                    f, tenant, event, expected_count, expected_hash
+                )
+            finally:
+                f.flush()
+                f.close()
 
     def _verify_all_snapshot(self, data):
         # Core of verify_all over an exact in-memory snapshot. Touches no path:
