@@ -204,6 +204,89 @@ class AuditChainTest(unittest.TestCase):
         import hashlib
         self.assertEqual(hashlib.sha256(payload).hexdigest(), row["hash"])
 
+    # --- verify_all ---
+
+    def test_verify_all_empty_and_missing_file(self):
+        self.assertEqual(self.chain.verify_all(), {"ok": True, "tenants": []})
+        self.path.write_text("", encoding="utf-8")
+        self.assertEqual(self.chain.verify_all(), {"ok": True, "tenants": []})
+
+    def test_verify_all_interleaved_first_appearance_order(self):
+        self.chain.append("b", {})
+        self.chain.append("a", {})
+        self.chain.append("b", {})
+        self.chain.append("a", {})
+        self.chain.append("c", {})
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": True, "tenants": [
+            {"tenant": "b", "count": 2},
+            {"tenant": "a", "count": 2},
+            {"tenant": "c", "count": 1},
+        ]})
+        # per-tenant verify still agrees
+        self.assertEqual(self.chain.verify("a"), {"ok": True, "count": 2})
+
+    def test_verify_all_tenant_types_kept_distinct_and_verbatim(self):
+        for t in (1, "1"):
+            self.chain.append(t, {})
+            self.chain.append(t, {})
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": True, "tenants": [
+            {"tenant": 1, "count": 2},
+            {"tenant": "1", "count": 2},
+        ]})
+
+    def test_verify_all_unparseable_line(self):
+        self.chain.append("t", {})
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("{oops\n")
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 2, "tenant": None, "reason": "missing"})
+
+    def test_verify_all_non_object_and_missing_tenant(self):
+        self.write(["[1,2,3]"])
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 1, "tenant": None, "reason": "missing"})
+        self.write([{"seq": 1, "event": {}, "prev": ZERO, "hash": "x"}])
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 1, "tenant": None, "reason": "missing"})
+
+    def test_verify_all_missing_field_reports_tenant(self):
+        self.write([{"tenant": "t", "seq": 1, "event": {}, "prev": ZERO}])  # no hash
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 1, "tenant": "t", "reason": "missing"})
+
+    def test_verify_all_sequence_error_uses_line_number(self):
+        self.chain.append("a", {})
+        row = {"tenant": "b", "seq": 2, "event": {}, "prev": ZERO}
+        row["hash"] = AuditChain._hash(row)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 2, "tenant": "b", "reason": "sequence"})
+
+    def test_verify_all_digest_error_stops_at_first(self):
+        good = {"tenant": "a", "seq": 1, "event": {}, "prev": ZERO}
+        good["hash"] = AuditChain._hash(good)
+        bad = {"tenant": "b", "seq": 1, "event": {}, "prev": "f" * 64}
+        bad["hash"] = AuditChain._hash(bad)
+        later_bad = {"tenant": "a", "seq": 9, "event": {}, "prev": good["hash"]}
+        later_bad["hash"] = AuditChain._hash(later_bad)
+        self.write([good, bad, later_bad])
+        r = self.chain.verify_all()
+        # first physical corruption wins; the later seq error must not override
+        self.assertEqual(r, {"ok": False, "at": 2, "tenant": "b", "reason": "digest"})
+
+    def test_verify_all_tampered_hash_is_digest(self):
+        self.chain.append("t", {})
+        rows = [json.loads(l) for l in self.read().splitlines()]
+        rows[0]["event"] = {"v": 2}
+        self.write(rows)
+        before = self.read()
+        r = self.chain.verify_all()
+        self.assertEqual(r, {"ok": False, "at": 1, "tenant": "t", "reason": "digest"})
+        self.assertEqual(self.read(), before)  # read-only, no side effects
+
 
 if __name__ == "__main__":
     unittest.main()

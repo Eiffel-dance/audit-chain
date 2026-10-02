@@ -83,6 +83,44 @@ class AuditChain:
             f.write(prefix + json.dumps(item, sort_keys=True) + "\n")
         return item
 
+    def verify_all(self):
+        # Validate every tenant chain in one read-only pass over the file, in
+        # physical line order. Each tenant gets an independent expected seq and
+        # prev digest starting at (1, ZERO) on first appearance; records of
+        # different tenants may interleave. The serialized tenant is only an
+        # internal key so distinct types (1 vs "1") stay separate chains while
+        # the original value is reported back unchanged.
+        states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
+        order = []   # (tenant_value, state) in first-appearance order
+        for line, raw in enumerate(self._read().splitlines(), 1):
+            try:
+                item = json.loads(raw)
+            except Exception:
+                return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
+            if not isinstance(item, dict) or "tenant" not in item:
+                return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
+            tenant = item["tenant"]
+            if any(k not in item for k in FIELDS):
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "missing"}
+            key = json.dumps(tenant, sort_keys=True, separators=(",", ":"))
+            state = states.get(key)
+            if state is None:
+                state = [1, ZERO, 0]
+                states[key] = state
+                order.append((tenant, state))
+            expected, prev, _ = state
+            if isinstance(item["seq"], bool) or item["seq"] != expected:
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "sequence"}
+            if item["prev"] != prev:
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
+            if item["hash"] != self._hash(item):
+                return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
+            state[0] += 1
+            state[1] = item["hash"]
+            state[2] += 1
+        return {"ok": True,
+                "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
+
     def verify(self, tenant, expected_count=None):
         try:
             count, _ = self._scan(tenant, self._read())
