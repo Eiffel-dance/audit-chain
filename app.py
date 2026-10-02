@@ -1,5 +1,10 @@
-import hashlib, json, math
+import hashlib, json, math, os, threading
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX fallback: in-process locking only
+    fcntl = None
 
 ZERO = "0" * 64
 FIELDS = ("tenant", "seq", "event", "prev", "hash")
@@ -74,6 +79,74 @@ class AuditChainStateError(Exception):
         super().__init__(f"invalid audit chain state for tenant {tenant!r} at seq {seq}{detail}")
 
 
+# --- concurrency: one consistent history under concurrent access ----------
+#
+# All append/verify/verify_all operations on the same path coordinate
+# through an advisory lock on the log file's own file descriptor (no
+# sidecar files, no network service). Writers take it exclusively around
+# the whole read-validate-append step; readers take it shared around the
+# snapshot read. flock locks are per open-file-description, so separate
+# os.open calls contend correctly both across processes and across
+# threads of one process. Where fcntl is unavailable, a per-process
+# threading lock keyed by path still serializes in-process access.
+
+_fallback_locks = {}
+_fallback_locks_guard = threading.Lock()
+
+
+def _fallback_lock(path):
+    key = os.path.abspath(os.fspath(path))
+    with _fallback_locks_guard:
+        lock = _fallback_locks.get(key)
+        if lock is None:
+            lock = _fallback_locks[key] = threading.Lock()
+    return lock
+
+
+class _FileLock:
+    # Context manager holding an advisory lock on fd. With fcntl this is
+    # an flock (LOCK_EX for writers, LOCK_SH for readers); otherwise it
+    # degrades to the per-process fallback lock for the same path.
+    def __init__(self, fd, path, exclusive):
+        self.fd, self.path, self.exclusive = fd, path, exclusive
+        self._fallback = None
+
+    def __enter__(self):
+        if fcntl is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+        else:
+            self._fallback = _fallback_lock(self.path)
+            self._fallback.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        if fcntl is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        else:
+            self._fallback.release()
+        return False
+
+
+def _read_fd(fd):
+    # Read the full current content of an open fd from the start.
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _write_all(fd, data):
+    # O_APPEND is set on the fd: every write lands at the current end of
+    # file, so existing bytes can never be overwritten or discarded.
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
 class _Broken(Exception):
     # Internal: first broken point found while scanning the file.
     # at     -- tenant seq when it can be determined, else None
@@ -87,8 +160,21 @@ class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
 
-    def _read_bytes(self):
-        return self.path.read_bytes() if self.path.exists() else b""
+    def _read_snapshot(self):
+        # Read one complete, self-consistent view of the log file: the
+        # shared lock is held while the bytes are read, so a concurrent
+        # append is observed either not at all or as its fully written
+        # record -- never as half a line. A missing file is the empty
+        # history (a legal pre-append view), as before.
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            return b""
+        try:
+            with _FileLock(fd, self.path, exclusive=False):
+                return _read_fd(fd)
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _decode_lines(data):
@@ -170,19 +256,33 @@ class AuditChain:
         # any append action (including corrupt-history rejection).
         _validate_json_value(tenant)
         _validate_json_value(event)
-        data = self._read_bytes()
-        lines, bad_line = self._decode_lines(data)
-        try:
-            count, prev = self._scan(tenant, lines, bad_line)
-        except _Broken as b:
-            seq = b.at if b.at is not None else b.expect
-            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
-        item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": prev}
-        item["hash"] = self._hash(item)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        prefix = b"" if not data or data.endswith(b"\n") else b"\n"
-        with self.path.open("ab") as f:
-            f.write(prefix + (json.dumps(item, sort_keys=True, allow_nan=False) + "\n").encode("utf-8"))
+        # O_APPEND: the kernel moves the file offset to the end on every
+        # write, so concurrent writers can never overwrite existing bytes.
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o666)
+        try:
+            # The exclusive lock is the write qualification: history is
+            # read, validated and extended atomically with respect to every
+            # other append/verify/verify_all on this path. seq, prev and
+            # hash are therefore always computed from the latest complete
+            # on-disk state as it is at the moment the record lands.
+            with _FileLock(fd, self.path, exclusive=True):
+                data = _read_fd(fd)
+                lines, bad_line = self._decode_lines(data)
+                try:
+                    count, prev = self._scan(tenant, lines, bad_line)
+                except _Broken as b:
+                    # History no longer matches the chain: refuse and leave
+                    # the file byte-for-byte untouched.
+                    seq = b.at if b.at is not None else b.expect
+                    raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+                item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": prev}
+                item["hash"] = self._hash(item)
+                prefix = b"" if not data or data.endswith(b"\n") else b"\n"
+                record = (json.dumps(item, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+                _write_all(fd, prefix + record)
+        finally:
+            os.close(fd)
         return item
 
     def verify_all(self):
@@ -194,7 +294,7 @@ class AuditChain:
         # the original value is reported back unchanged.
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
-        lines, bad_line = self._decode_lines(self._read_bytes())
+        lines, bad_line = self._decode_lines(self._read_snapshot())
         for line, raw in enumerate(lines, 1):
             try:
                 item = _strict_loads(raw)
@@ -228,7 +328,7 @@ class AuditChain:
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
 
     def verify(self, tenant, expected_count=None):
-        lines, bad_line = self._decode_lines(self._read_bytes())
+        lines, bad_line = self._decode_lines(self._read_snapshot())
         try:
             count, _ = self._scan(tenant, lines, bad_line)
         except _Broken as b:

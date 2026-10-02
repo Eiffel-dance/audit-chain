@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -463,6 +464,153 @@ class AuditChainTest(unittest.TestCase):
         self.assertEqual(item["prev"], ZERO)
         self.assertEqual(self.chain.verify(True), {"ok": True, "count": 1})
         self.assertEqual(self.chain.verify(1), {"ok": True, "count": 1})
+
+
+class AuditChainConcurrencyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "audit.jsonl"
+        self.chain = AuditChain(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_threads(self, workers):
+        errors = []
+
+        def guard(fn):
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 - collected and re-raised
+                errors.append(exc)
+
+        threads = [threading.Thread(target=guard, args=(w,)) for w in workers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+
+    def test_concurrent_appends_same_tenant_form_one_contiguous_chain(self):
+        threads, per_thread = 8, 25
+        results = [[] for _ in range(threads)]
+
+        def make(i):
+            def work():
+                for j in range(per_thread):
+                    results[i].append(self.chain.append("t", {"i": i, "j": j}))
+            return work
+
+        self.run_threads([make(i) for i in range(threads)])
+        total = threads * per_thread
+        # every successful append produced a distinct, contiguous seq
+        seqs = sorted(item["seq"] for slot in results for item in slot)
+        self.assertEqual(seqs, list(range(1, total + 1)))
+        # returned items correspond 1:1 to records in the file
+        rows = [json.loads(l) for l in
+                self.path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), total)
+        self.assertEqual(self.chain.verify("t"), {"ok": True, "count": total})
+
+    def test_concurrent_appends_interleaved_tenants_each_count_from_one(self):
+        tenants = ["a", "b", "c"]
+        per_tenant = 20
+
+        def make(tenant):
+            def work():
+                for i in range(per_tenant):
+                    self.chain.append(tenant, {"i": i})
+            return work
+
+        self.run_threads([make(t) for t in tenants for _ in range(3)])
+        for t in tenants:
+            self.assertEqual(self.chain.verify(t),
+                             {"ok": True, "count": 3 * per_tenant})
+        r = self.chain.verify_all()
+        self.assertTrue(r["ok"])
+        self.assertEqual(sorted(x["count"] for x in r["tenants"]),
+                         [3 * per_tenant] * 3)
+
+    def test_verify_and_verify_all_during_appends_always_see_legal_history(self):
+        stop = threading.Event()
+        observations = [[], []]
+
+        def writer():
+            for i in range(60):
+                self.chain.append("t", {"i": i})
+            stop.set()
+
+        def make_reader(slot):
+            def reader():
+                while not stop.is_set():
+                    r = self.chain.verify("t")
+                    self.assertTrue(r["ok"], r)
+                    observations[slot].append(r["count"])
+                    r = self.chain.verify_all()
+                    self.assertTrue(r["ok"], r)
+            return reader
+
+        self.run_threads([writer, make_reader(0), make_reader(1)])
+        # each reader observes a non-decreasing sequence of legal histories
+        for seen in observations:
+            self.assertTrue(seen)
+            self.assertEqual(seen, sorted(seen))
+        self.assertEqual(self.chain.verify("t"), {"ok": True, "count": 60})
+
+    def test_concurrent_append_to_corrupt_history_all_refused_and_file_kept(self):
+        row = {"tenant": "t", "seq": 1, "event": {}, "prev": ZERO}
+        row["hash"] = AuditChain._hash(row)
+        row["event"] = {"tampered": True}
+        with self.path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+        before = self.path.read_bytes()
+        outcomes = []
+
+        def work():
+            try:
+                self.chain.append("t", {})
+                outcomes.append("appended")
+            except AuditChainStateError as e:
+                outcomes.append((e.tenant, e.seq, e.reason, e.line))
+
+        self.run_threads([work] * 6)
+        self.assertEqual(len(outcomes), 6)
+        for o in outcomes:
+            self.assertEqual(o, ("t", 1, "digest", 1))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_concurrent_value_error_still_priority_over_state(self):
+        # corrupt history + illegal event: ValueError must win in every thread
+        self.write_corrupt()
+
+        def work():
+            with self.assertRaises(ValueError):
+                self.chain.append("t", float("nan"))
+
+        self.run_threads([work] * 4)
+
+    def write_corrupt(self):
+        row = {"tenant": "t", "seq": 5, "event": {}, "prev": ZERO}
+        row["hash"] = AuditChain._hash(row)
+        with self.path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def test_concurrent_appends_across_processes(self):
+        import subprocess, sys
+        workers, per_worker = 4, 10
+        script = (
+            "import sys; sys.path.insert(0, %r);"
+            "from app import AuditChain;"
+            "c = AuditChain(%r);"
+            "[c.append('p', {'i': i}) for i in range(%d)]"
+        ) % (str(Path(app.__file__).parent), str(self.path), per_worker)
+        procs = [subprocess.Popen([sys.executable, "-c", script])
+                 for _ in range(workers)]
+        for p in procs:
+            self.assertEqual(p.wait(), 0)
+        self.assertEqual(self.chain.verify("p"),
+                         {"ok": True, "count": workers * per_worker})
 
 
 if __name__ == "__main__":
