@@ -83,6 +83,31 @@ def _validate_expected_count(expected_count):
         )
 
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _validate_head_assertion(expected_count, expected_hash):
+    # append_if_head takes both expectations unconditionally: expected_count
+    # is a required non-negative plain int (bool rejected even though it is an
+    # int subclass, along with floats and every other type), and
+    # expected_hash is exactly 64 lowercase hex characters -- the shape of
+    # ZERO and of the hashes the chain itself emits. Uppercase, wrong length
+    # and non-str inputs are all ValueError. Both are checked before the log
+    # is read, so a malformed call never creates or touches the file.
+    if isinstance(expected_count, bool) or not isinstance(expected_count, int) \
+            or expected_count < 0:
+        raise ValueError(
+            "expected_count must be a non-negative integer, got "
+            f"{expected_count!r}"
+        )
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64 \
+            or any(c not in _HEX_DIGITS for c in expected_hash):
+        raise ValueError(
+            "expected_hash must be 64 lowercase hexadecimal characters, got "
+            f"{expected_hash!r}"
+        )
+
+
 class AuditChainStateError(Exception):
     def __init__(self, tenant, seq, reason=None, line=None):
         self.tenant = tenant
@@ -91,6 +116,26 @@ class AuditChainStateError(Exception):
         self.line = line
         detail = f" (line {line})" if line is not None else ""
         super().__init__(f"invalid audit chain state for tenant {tenant!r} at seq {seq}{detail}")
+
+
+class AuditChainConflictError(Exception):
+    # The caller's head assertion matched the shape rules but not the chain
+    # head observed under the exclusive lease: expected (count, last hash)
+    # differ from the actual (count, last hash), actual_hash being ZERO for
+    # an empty chain. reason is fixed at "conflict" and no byte is written.
+    def __init__(self, tenant, expected_count, expected_hash,
+                 actual_count, actual_hash):
+        self.tenant = tenant
+        self.expected_count = expected_count
+        self.expected_hash = expected_hash
+        self.actual_count = actual_count
+        self.actual_hash = actual_hash
+        self.reason = "conflict"
+        super().__init__(
+            f"audit chain head conflict for tenant {tenant!r}: "
+            f"expected count {expected_count} hash {expected_hash}, "
+            f"actual count {actual_count} hash {actual_hash}"
+        )
 
 
 class _Broken(Exception):
@@ -301,6 +346,52 @@ class AuditChain:
             block = prefix + "".join(chunks).encode("utf-8")
             f.write(block)
             return items
+
+    def append_if_head(self, tenant, event, expected_count, expected_hash):
+        # Conditional append: exactly like append, but only when the tenant's
+        # complete verified history ends at (expected_count, expected_hash).
+        # Every argument crosses its boundary before the lease is taken, and
+        # therefore before the log is read or could be created: tenant/event
+        # use the same standard-JSON rule as append, expected_count is a
+        # required non-negative plain int and expected_hash is exactly 64
+        # lowercase hex characters (ZERO for the empty chain). A malformed
+        # assertion raises ValueError regardless of contention or file state.
+        _validate_json_value(tenant)
+        _validate_json_value(event)
+        _validate_head_assertion(expected_count, expected_hash)
+        with self._write_lease() as f:
+            # One exclusive lease covers validation, comparison and the write
+            # on the same file description, so competing callers asserting the
+            # same head serialize: the first to observe a matching head
+            # appends, every later one observes that record already on disk
+            # and gets a deterministic AuditChainConflictError instead of
+            # appending. The full tenant history is scanned with the exact
+            # rules append uses, so corruption surfaces as
+            # AuditChainStateError with identical tenant/seq/line/reason
+            # semantics and takes priority over the assertion comparison.
+            data = f.read()
+            lines, bad_line = self._decode_lines(data)
+            try:
+                count, prev = self._scan(tenant, lines, bad_line)
+            except _Broken as b:
+                seq = b.at if b.at is not None else b.expect
+                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+            # The assertion matches only when both the length and the last
+            # hash equal; an empty chain has length 0 and head ZERO, so it is
+            # compared by the very same rule. A mismatch raises without a
+            # single byte being written, reporting the head actually read.
+            if count != expected_count or prev != expected_hash:
+                raise AuditChainConflictError(
+                    tenant, expected_count, expected_hash, count, prev
+                )
+            item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": prev}
+            item["hash"] = self._hash(item)
+            prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+            record = prefix + (
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            ).encode("utf-8")
+            f.write(record)
+            return item
 
     def _verify_all_snapshot(self, data):
         # Core of verify_all over an exact in-memory snapshot. Touches no path:
