@@ -479,6 +479,14 @@ class AuditChain:
         # file itself is opened read-only below, so a rejected call leaves
         # every byte untouched and creates nothing.
         _validate_json_value(tenant)
+        # expected_count crosses the exact same boundary as in verify_bytes,
+        # and likewise before any history byte is read: None means no length
+        # expectation, otherwise only a non-bool, non-negative int is valid.
+        # A negative number, bool, float, string or any other type raises
+        # ValueError here -- ahead of the snapshot read -- so the file entry
+        # point and the in-memory entry point agree on the exception and its
+        # priority even when the log is corrupt or the path does not exist.
+        _validate_expected_count(expected_count)
         return self._verify_snapshot(
             tenant, self._read_snapshot(), expected_count
         )
