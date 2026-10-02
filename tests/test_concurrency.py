@@ -277,6 +277,52 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertEqual(self.chain.verify_all(), {"ok": True, "tenants": []})
         self.assertFalse(self.path.exists())
 
+    def test_verify_boundary_holds_during_concurrent_appends(self):
+        # Repeated verify calls racing appends: illegal tenants must raise
+        # ValueError every time (never TypeError/RecursionError, never a
+        # verdict), and legal verifies must only see consistent snapshots.
+        stop = threading.Event()
+        problems = []
+        box = threading.Lock()
+
+        def reader():
+            while not stop.is_set():
+                for bad in (float("nan"), {"k": float("inf")}, {1: "x"}):
+                    try:
+                        self.chain.verify(bad)
+                        with box:
+                            problems.append(("accepted", repr(bad)))
+                    except ValueError:
+                        pass
+                    except Exception as e:  # noqa: BLE001
+                        with box:
+                            problems.append(("leaked", repr(e)))
+                r = self.chain.verify("t")
+                if not r["ok"]:
+                    with box:
+                        problems.append(("verify", r))
+
+        readers = [threading.Thread(target=reader, daemon=True)
+                   for _ in range(4)]
+        for t in readers:
+            t.start()
+
+        def writer(i):
+            for j in range(25):
+                self.chain.append("t", {"w": i, "j": j})
+
+        writers = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+        stop.set()
+        for t in readers:
+            t.join(timeout=2)
+
+        self.assertEqual(problems, [])
+        self.assertEqual(self.chain.verify("t"), {"ok": True, "count": 200})
+
     def test_legacy_file_without_trailing_newline_appends_safely(self):
         self.chain.append("t", {"v": 1})
         self.path.write_bytes(self.path.read_bytes().rstrip(b"\n"))

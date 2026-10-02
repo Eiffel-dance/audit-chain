@@ -332,6 +332,15 @@ class AuditChain:
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
 
     def verify(self, tenant, expected_count=None):
+        # The tenant crosses the same standard-JSON input boundary as in
+        # append/append_batch, and it is checked before any history is read:
+        # NaN/Infinity/-Infinity, non-string object keys, cyclic containers
+        # and values without a standard JSON encoding raise ValueError here,
+        # never TypeError/RecursionError from a downstream json.dumps, and
+        # never a verdict computed against a corrupt or missing file. The
+        # file itself is opened read-only below, so a rejected call leaves
+        # every byte untouched and creates nothing.
+        _validate_json_value(tenant)
         data = self._read_snapshot()
         lines, bad_line = self._decode_lines(data)
         try:

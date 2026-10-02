@@ -1,0 +1,2 @@
+{"event": {"action": "create", "id": 1}, "hash": "752ee64229d6b543c85fd6aa57c3faa804179b4cee80a35c25da9fa5e393ba15", "prev": "0000000000000000000000000000000000000000000000000000000000000000", "seq": 1, "tenant": "tenant-a"}
+{"event": {"action": "update", "id": 1}, "hash": "dd704919b01f0645e31fa31f844e7fe413e87b78135cec746396328b494c1bf8", "prev": "752ee64229d6b543c85fd6aa57c3faa804179b4cee80a35c25da9fa5e393ba15", "seq": 2, "tenant": "tenant-a"}

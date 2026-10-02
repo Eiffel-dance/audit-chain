@@ -464,6 +464,89 @@ class AuditChainTest(unittest.TestCase):
         self.assertEqual(self.chain.verify(True), {"ok": True, "count": 1})
         self.assertEqual(self.chain.verify(1), {"ok": True, "count": 1})
 
+    # --- verify tenant input boundary: same standard-JSON rules as append ---
+
+    def test_verify_rejects_non_finite_number_tenants(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                self.chain.verify(bad)
+            with self.assertRaises(ValueError):
+                self.chain.verify(bad, 0)
+        # a rejected verify reads nothing and creates nothing
+        self.assertFalse(self.path.exists())
+
+    def test_verify_rejects_nested_non_finite_and_non_string_keys(self):
+        bad_tenants = [
+            {"k": float("nan")},
+            [1, [float("-inf")]],
+            {1: "x"},
+            {"a": {2: 3}},
+        ]
+        for bad in bad_tenants:
+            with self.assertRaises(ValueError):
+                self.chain.verify(bad)
+        self.assertFalse(self.path.exists())
+
+    def test_verify_rejects_cyclic_tenant_with_value_error(self):
+        cyc = []
+        cyc.append(cyc)
+        with self.assertRaises(ValueError):
+            self.chain.verify(cyc)
+        d = {}
+        d["self"] = d
+        with self.assertRaises(ValueError):
+            self.chain.verify(d)
+
+    def test_verify_rejects_unencodable_tenant_with_value_error(self):
+        # none of these may leak TypeError/RecursionError/json errors
+        for bad in (object(), b"bytes", {1, 2}, ("a", 1)):
+            with self.assertRaises(ValueError):
+                self.chain.verify(bad)
+
+    def test_verify_value_error_beats_corrupt_history_and_keeps_bytes(self):
+        row = {"tenant": "t", "seq": 1, "event": {}, "prev": ZERO}
+        row["hash"] = AuditChain._hash(row)
+        row["event"] = {"tampered": True}  # digest broken at line 1
+        self.write([row])
+        before = self.path.read_bytes()
+        for bad in (float("nan"), {"k": float("inf")}, {1: "x"}):
+            with self.assertRaises(ValueError):
+                self.chain.verify(bad)
+        self.assertEqual(self.path.read_bytes(), before)
+        # a legal tenant still sees the corruption verdict, unchanged
+        r = self.chain.verify("t")
+        self.assertEqual((r["ok"], r["at"], r["reason"]), (False, 1, "digest"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_verify_nested_object_tenant_key_order_normalized(self):
+        t1 = {"a": [1, {"x": 1, "y": 2}], "b": {"p": True, "q": None}}
+        t2 = {"b": {"q": None, "p": True}, "a": [1, {"y": 2, "x": 1}]}
+        self.chain.append(t1, {"i": 1})
+        item = self.chain.append(t2, {"i": 2})
+        self.assertEqual(item["seq"], 2)
+        self.assertEqual(self.chain.verify(t2), {"ok": True, "count": 2})
+        self.assertEqual(self.chain.verify(t1, 2), {"ok": True, "count": 2})
+        r = self.chain.verify(t2, 3)
+        self.assertEqual((r["ok"], r["at"], r["reason"]), (False, 3, "missing"))
+
+    def test_verify_number_spelling_tenants_stay_distinct(self):
+        # 1, 1.0, true and "1" remain four partitions on the read path too
+        for t in (1, 1.0, True, "1"):
+            self.chain.append(t, {})
+        for t in (1, 1.0, True, "1"):
+            self.assertEqual(self.chain.verify(t), {"ok": True, "count": 1})
+            self.assertEqual(self.chain.verify(t, 1), {"ok": True, "count": 1})
+            r = self.chain.verify(t, 2)
+            self.assertEqual((r["ok"], r["at"], r["reason"]), (False, 2, "missing"))
+
+    def test_verify_legal_tenant_after_rejected_one_unaffected(self):
+        self.chain.append("t", {})
+        with self.assertRaises(ValueError):
+            self.chain.verify(float("nan"))
+        self.assertEqual(self.chain.verify("t"), {"ok": True, "count": 1})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": True, "tenants": [{"tenant": "t", "count": 1}]})
+
 
 if __name__ == "__main__":
     unittest.main()
