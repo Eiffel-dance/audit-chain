@@ -391,6 +391,67 @@ class AuditChain:
                 )
         return b"".join(chunks)
 
+    def read_tenant(self, tenant, start_seq=1, page_size=None):
+        # Read-only, single-tenant paged view. Returns plain record dicts
+        # (each carrying exactly the tenant/seq/event/prev/hash fields with
+        # their on-disk values) ordered by ascending seq; records of other
+        # tenants may interleave on disk but never appear here or move the
+        # page boundaries, since seqs are the target tenant's own 1..count.
+        #
+        # Every input crosses its boundary before any byte is read: the tenant
+        # uses the same standard-JSON rule as append/verify/export, and
+        # start_seq/page_size must be unambiguous positive integers (bool is
+        # rejected even though it subclasses int; floats and other types are
+        # too), with page_size additionally allowed to be None. A rejected
+        # call reads nothing and, via the read-only snapshot below, can never
+        # create or alter the log.
+        _validate_json_value(tenant)
+        if isinstance(start_seq, bool) or not isinstance(start_seq, int) \
+                or start_seq < 1:
+            raise ValueError(
+                f"start_seq must be a positive integer, got {start_seq!r}"
+            )
+        if page_size is not None and (
+            isinstance(page_size, bool) or not isinstance(page_size, int)
+            or page_size < 1
+        ):
+            raise ValueError(
+                "page_size must be a positive integer or None, got "
+                f"{page_size!r}"
+            )
+        # One shared-lease snapshot, exactly as verify/export use: the result
+        # is the full tenant history either wholly before or wholly after any
+        # concurrent append, never a torn page. A missing path or an unknown
+        # tenant is simply an empty chain and yields [].
+        data = self._read_snapshot()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            # The whole tenant history -- first record through chain tail --
+            # must verify with the exact JSON identity, sequence and digest
+            # rules of verify before a single record is surfaced. Slicing
+            # happens only after this, so a broken chain raises
+            # AuditChainStateError (same tenant/seq/reason/line location as
+            # verify/append/export) even when the requested page lies entirely
+            # before the damage; no verified prefix is ever returned.
+            self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # Snapshot proven valid: collect the target tenant in physical order
+        # (identical to seq order for that tenant), then take the page purely
+        # in memory. A start past the current count or a short tail page just
+        # yields the available suffix, possibly [], rather than an error.
+        key = self._tenant_key(tenant)
+        records = []
+        for raw in lines:
+            item = _strict_loads(raw)
+            if self._tenant_key(item["tenant"]) == key:
+                records.append(item)
+        lo = start_seq - 1
+        if page_size is None:
+            return records[lo:]
+        return records[lo:lo + page_size]
+
     def _verify_snapshot(self, tenant, data, expected_count=None):
         # Core of verify over an exact in-memory snapshot: the same JSON
         # canonicalization, tenant identity and digest rules as the file path,
