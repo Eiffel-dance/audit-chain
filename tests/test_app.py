@@ -161,6 +161,119 @@ class AuditChainTest(unittest.TestCase):
         self.assertEqual((r["at"], r["reason"]), (2, "sequence"))
         self.assertEqual(self.chain.verify("b"), {"ok": True, "count": 1})
 
+    # --- corruption: illegal UTF-8 bytes in the file ---
+
+    def _write_bytes(self, data):
+        with self.path.open("wb") as f:
+            f.write(data)
+
+    def _valid_row(self, tenant="t", seq=1, prev=ZERO):
+        row = {"tenant": tenant, "seq": seq, "event": {}, "prev": prev}
+        row["hash"] = AuditChain._hash(row)
+        return (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+
+    def test_illegal_utf8_first_byte_is_missing_line_one(self):
+        self._write_bytes(b"\xff\xfe")
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 1, "reason": "missing"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 1, "tenant": None, "reason": "missing"})
+
+    def test_illegal_utf8_on_last_line_without_newline(self):
+        # bad byte is the second physical line even with no trailing newline
+        self._write_bytes(self._valid_row() + b'{"tenant":\xff}')
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 2, "reason": "missing"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 2, "tenant": None, "reason": "missing"})
+
+    def test_illegal_utf8_alone_after_newline_still_next_line(self):
+        self._write_bytes(self._valid_row() + b"\xff")
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 2, "reason": "missing"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 2, "tenant": None, "reason": "missing"})
+
+    def test_truncated_multibyte_counts_lfs_before_it(self):
+        self._write_bytes(self._valid_row("x") + self._valid_row("y") + b"abc\xc2\n")
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 3, "reason": "missing"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 3, "tenant": None, "reason": "missing"})
+
+    def test_illegal_utf8_verify_result_keeps_only_existing_fields(self):
+        self._write_bytes(b"\xff")
+        self.assertEqual(set(self.chain.verify("t")), {"ok", "at", "reason"})
+
+    def test_earlier_digest_error_beats_later_bad_bytes(self):
+        good = {"tenant": "t", "seq": 1, "event": {}, "prev": ZERO}
+        good["hash"] = AuditChain._hash(good)
+        tampered = dict(good)
+        tampered["event"] = {"z": 9}
+        self._write_bytes(
+            (json.dumps(tampered, sort_keys=True) + "\n").encode("utf-8") + b"\xff\n"
+        )
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 1, "reason": "digest"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 1, "tenant": "t", "reason": "digest"})
+
+    def test_earlier_sequence_error_beats_later_bad_bytes(self):
+        row = {"tenant": "t", "seq": 2, "event": {}, "prev": ZERO}
+        row["hash"] = AuditChain._hash(row)
+        self._write_bytes((json.dumps(row, sort_keys=True) + "\n").encode("utf-8") + b"\xff")
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 1, "reason": "sequence"})
+
+    def test_earlier_unparseable_json_beats_later_bad_bytes(self):
+        self._write_bytes(b"{oops\n\xff")
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 1, "reason": "missing"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 1, "tenant": None, "reason": "missing"})
+
+    def test_valid_utf8_garbage_still_missing_not_digest_or_sequence(self):
+        for raw in (b"\n", b"   \n", b"[1,2]\n"):
+            self._write_bytes(raw)
+            self.assertEqual(self.chain.verify("t"),
+                             {"ok": False, "at": 1, "reason": "missing"}, raw)
+        # complete object minus hash -> missing at its own seq, never digest
+        self.write([{"tenant": "t", "seq": 1, "event": {}, "prev": ZERO}])
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 1, "reason": "missing"})
+
+    def test_append_rejects_illegal_utf8_with_expected_seq_and_line(self):
+        before = self._valid_row() + b"\xffgarbage"
+        self._write_bytes(before)
+        with self.assertRaises(AuditChainStateError) as cm:
+            self.chain.append("t", {})
+        # one valid t record -> next expected seq is 2; bad byte is on line 2
+        self.assertEqual(cm.exception.tenant, "t")
+        self.assertEqual(cm.exception.seq, 2)
+        self.assertEqual(cm.exception.reason, "missing")
+        self.assertEqual(cm.exception.line, 2)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_append_rejects_illegal_utf8_seq_one_for_unseen_tenant(self):
+        before = self._valid_row("x") + b"\xff"
+        self._write_bytes(before)
+        with self.assertRaises(AuditChainStateError) as cm:
+            self.chain.append("t", {})
+        self.assertEqual((cm.exception.tenant, cm.exception.seq,
+                          cm.exception.reason, cm.exception.line),
+                         ("t", 1, "missing", 2))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_append_missing_or_empty_file_starts_at_seq_one(self):
+        # nonexistent file starts at seq 1 / ZERO
+        item = self.chain.append("t", {})
+        self.assertEqual((item["seq"], item["prev"]), (1, ZERO))
+        self.path.unlink()
+        # completely empty file behaves identically
+        self._write_bytes(b"")
+        item = self.chain.append("t", {})
+        self.assertEqual((item["seq"], item["prev"]), (1, ZERO))
+
     # --- append must reject corrupt history without modifying file ---
 
     def test_append_rejects_and_keeps_file(self):

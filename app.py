@@ -28,8 +28,29 @@ class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
 
-    def _read(self):
-        return self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+    def _read_bytes(self):
+        return self.path.read_bytes() if self.path.exists() else b""
+
+    @staticmethod
+    def _decode_lines(data):
+        # Split the raw JSONL bytes into physical lines while treating the
+        # first illegal UTF-8 byte as a hard, locatable stop point.
+        # Returns (lines, bad_line): lines are the complete physical lines
+        # preceding any corruption (all lines when the file is valid UTF-8),
+        # bad_line is the 1-based line number of the first undecodable line
+        # or None. A bad line is never yielded, even if the bytes before the
+        # illegal byte looked like complete JSON: callers scan the preceding
+        # complete lines first, so an earlier JSON/sequence/digest error
+        # still takes priority.
+        try:
+            return data.decode("utf-8").splitlines(), None
+        except UnicodeDecodeError as exc:
+            # start is the offset of the first byte that cannot be decoded;
+            # everything before it is a valid UTF-8 prefix.
+            start = exc.start
+        bad_line = data.count(b"\n", 0, start) + 1
+        cut = data.rfind(b"\n", 0, start) + 1  # start of the bad line
+        return data[:cut].decode("utf-8").splitlines(), bad_line
 
     @staticmethod
     def _tenant_key(tenant):
@@ -47,15 +68,17 @@ class AuditChain:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _scan(self, tenant, text):
-        # Validate the target tenant's chain over the whole UTF-8 JSONL file.
+    def _scan(self, tenant, lines, bad_line=None):
+        # Validate the target tenant's chain over the decoded JSONL lines.
         # Returns (verified_count, last_hash). Raises _Broken at the first
         # problem; records of other tenants may interleave and are skipped.
         # Tenant matching uses the same canonical JSON identity as
-        # verify_all, never host-language loose equality.
+        # verify_all, never host-language loose equality. If bad_line is
+        # given, an undecodable physical line follows the lines provided;
+        # it is reported as missing only when no earlier problem was found.
         key = self._tenant_key(tenant)
         expected, prev, count = 1, ZERO, 0
-        for line, raw in enumerate(text.splitlines(), 1):
+        for line, raw in enumerate(lines, 1):
             try:
                 item = json.loads(raw)
             except Exception:
@@ -77,21 +100,24 @@ class AuditChain:
             count += 1
             prev = item["hash"]
             expected += 1
+        if bad_line is not None:
+            raise _Broken("missing", None, bad_line, expected)
         return count, prev
 
     def append(self, tenant, event):
-        text = self._read()
+        data = self._read_bytes()
+        lines, bad_line = self._decode_lines(data)
         try:
-            count, prev = self._scan(tenant, text)
+            count, prev = self._scan(tenant, lines, bad_line)
         except _Broken as b:
             seq = b.at if b.at is not None else b.expect
             raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
         item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": prev}
         item["hash"] = self._hash(item)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        prefix = "" if not text or text.endswith("\n") else "\n"
-        with self.path.open("a", encoding="utf-8", newline="") as f:
-            f.write(prefix + json.dumps(item, sort_keys=True) + "\n")
+        prefix = b"" if not data or data.endswith(b"\n") else b"\n"
+        with self.path.open("ab") as f:
+            f.write(prefix + (json.dumps(item, sort_keys=True) + "\n").encode("utf-8"))
         return item
 
     def verify_all(self):
@@ -103,7 +129,8 @@ class AuditChain:
         # the original value is reported back unchanged.
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
-        for line, raw in enumerate(self._read().splitlines(), 1):
+        lines, bad_line = self._decode_lines(self._read_bytes())
+        for line, raw in enumerate(lines, 1):
             try:
                 item = json.loads(raw)
             except Exception:
@@ -129,12 +156,16 @@ class AuditChain:
             state[0] += 1
             state[1] = item["hash"]
             state[2] += 1
+        if bad_line is not None:
+            # First undecodable byte: tenant cannot be parsed, so None.
+            return {"ok": False, "at": bad_line, "tenant": None, "reason": "missing"}
         return {"ok": True,
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
 
     def verify(self, tenant, expected_count=None):
+        lines, bad_line = self._decode_lines(self._read_bytes())
         try:
-            count, _ = self._scan(tenant, self._read())
+            count, _ = self._scan(tenant, lines, bad_line)
         except _Broken as b:
             return {"ok": False, "at": b.at if b.at is not None else b.line, "reason": b.reason}
         if expected_count is not None:
