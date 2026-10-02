@@ -203,6 +203,21 @@ class AuditChain:
             raise _Broken("missing", None, bad_line, expected)
         return count, prev
 
+    def _collect_tenant(self, lines, key):
+        # Pick the verified target tenant's records out of already-decoded
+        # physical lines in physical order, re-emitting each through the same
+        # serialization as append. The snapshot has already passed the exact
+        # same scan verify uses, so every line is a complete dict carrying
+        # "tenant"; other tenants interleave freely without being reordered
+        # or carried into the export.
+        chunks = []
+        for raw in lines:
+            item = _strict_loads(raw)
+            if self._tenant_key(item["tenant"]) != key:
+                continue
+            chunks.append(json.dumps(item, sort_keys=True, allow_nan=False) + "\n")
+        return "".join(chunks).encode("utf-8")
+
     def append(self, tenant, event):
         # Validate the new input against the standard-JSON boundary before
         # anything else: an illegal tenant/event raises ValueError without
@@ -353,3 +368,33 @@ class AuditChain:
             if count > expected_count:
                 return {"ok": False, "at": expected_count + 1, "reason": "sequence"}
         return {"ok": True, "count": count}
+
+    def export_tenant(self, tenant):
+        # Offline migration export for one tenant. Returns UTF-8 JSONL bytes
+        # containing exactly the target tenant's records in their physical
+        # order of appearance; it creates/rewrites no file and touches no
+        # network. The tenant crosses the same standard-JSON input boundary
+        # as append/verify, and is validated before the path is read, so an
+        # illegal tenant raises ValueError without reading or creating
+        # anything even when the on-disk history is also corrupt.
+        _validate_json_value(tenant)
+        # One shared-leased read-only snapshot, exactly like verify: the
+        # bytes below are the full state wholly before or after some append.
+        data = self._read_snapshot()
+        lines, bad_line = self._decode_lines(data)
+        # The complete verify(tenant) scan runs and must succeed before any
+        # output bytes are produced: a corrupt prefix can never be returned
+        # as a partial export. Error fields follow the append mapping (the
+        # target tenant, the first seq that should be checked, the reason
+        # and the physical line), with missing/sequence/digest priority and
+        # line numbers identical to the existing scan rules.
+        try:
+            self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # A missing or empty file is a legitimate empty snapshot (the read
+        # returns b""), as is a file in which the tenant never appears: the
+        # scan succeeds with count 0 and the collection below yields b"".
+        key = self._tenant_key(tenant)
+        return self._collect_tenant(lines, key)
