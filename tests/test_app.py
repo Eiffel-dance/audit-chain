@@ -464,6 +464,132 @@ class AuditChainTest(unittest.TestCase):
         self.assertEqual(self.chain.verify(True), {"ok": True, "count": 1})
         self.assertEqual(self.chain.verify(1), {"ok": True, "count": 1})
 
+    # --- standard JSON input boundary on append ---
+
+    def test_append_accepts_every_standard_json_value(self):
+        for t in (None, True, False, 0, -7, 1.0, 1.5, -0.0, 10 ** 100, "",
+                  "s", [], [1, "a", None, True, [{}]],
+                  {"a": 1, "b": [1, {"c": None}]},
+                  {"nested": {"deep": [True, False, 1, 1.0]}}):
+            item = self.chain.append(t, t)
+            self.assertEqual(item["seq"], 1, repr(t))
+            self.path.unlink()
+
+    def test_append_rejects_non_finite_numbers(self):
+        for v in (float("nan"), float("inf"), -float("inf")):
+            self.assertRaises(ValueError, self.chain.append, v, {})
+            self.assertRaises(ValueError, self.chain.append, "t", v)
+            self.assertRaises(ValueError, self.chain.append, "t", {"x": [v]})
+
+    def test_append_rejects_non_json_types_and_non_string_keys(self):
+        for v in ((1, 2), b"x", {1, 2}, frozenset(), object(),
+                  {1: 2}, {None: 1}, {True: 0}, {"a": {1: 1}},
+                  [{"x": float("nan")}]):
+            self.assertRaises(ValueError, self.chain.append, v, {})
+            self.assertRaises(ValueError, self.chain.append, "t", v)
+
+    def test_invalid_append_writes_nothing_for_every_file_state(self):
+        # nonexistent file
+        self.assertRaises(ValueError, self.chain.append, float("nan"), {})
+        self.assertFalse(self.path.exists())
+        # empty file
+        self._write_bytes(b"")
+        self.assertRaises(ValueError, self.chain.append, "t", {1: 2})
+        self.assertEqual(self.path.read_bytes(), b"")
+        # file with existing valid content
+        self.chain.append("keep", {})
+        before = self.path.read_bytes()
+        self.assertRaises(ValueError, self.chain.append, "t", float("inf"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_invalid_input_valueerror_beats_corrupt_history(self):
+        self._write_bytes(b"{oops\n")
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.chain.append("t", float("nan"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_successful_append_writes_strict_standard_jsonl(self):
+        self.chain.append("t", {"y": ["a", None, True, 1.0, {"z": -2}]})
+        raw = self.path.read_text(encoding="utf-8")
+        # a strict decoder must accept the physical line without NaN/Infinity
+        json.loads(raw, parse_constant=lambda name: (_ for _ in ()).throw(
+            AssertionError(name)))
+
+    # --- non-standard JSON physical lines: missing-class corruption ---
+
+    def assert_missing_at_line(self, payload, line, tenant_arg="t"):
+        self._write_bytes(payload)
+        r = self.chain.verify(tenant_arg)
+        self.assertEqual((r["ok"], r["at"], r["reason"]),
+                         (False, line, "missing"), payload)
+        self.assertEqual(set(r), {"ok", "at", "reason"})
+        r2 = self.chain.verify_all()
+        self.assertEqual(r2, {"ok": False, "at": line,
+                              "tenant": None, "reason": "missing"}, payload)
+
+    def test_non_standard_constant_lines_are_missing(self):
+        for tok in (b"NaN", b"Infinity", b"-Infinity"):
+            self.assert_missing_at_line(tok + b"\n", 1)
+
+    def test_non_standard_constant_inside_record_is_missing(self):
+        for tok in ("NaN", "Infinity", "-Infinity"):
+            row = ('{"tenant":"t","seq":1,"event":%s,"prev":"%s","hash":"x"}'
+                   % (tok, ZERO)).encode("utf-8")
+            self.assert_missing_at_line(row + b"\n", 1)
+
+    def test_overflow_number_to_infinity_is_missing(self):
+        self.assert_missing_at_line(b"[1e309]\n", 1)
+        row = ('{"tenant":"t","seq":1,"event":{"x":-1e400},'
+               '"prev":"%s","hash":"x"}' % ZERO).encode("utf-8")
+        self.assert_missing_at_line(row + b"\n", 1)
+
+    def test_duplicate_object_keys_are_missing(self):
+        self.assert_missing_at_line(b'{"a":1,"a":2}\n', 1)
+        # duplicate keys nested inside an otherwise complete-looking record
+        row = ('{"tenant":"t","seq":1,"event":{"a":{"b":1,"b":2}},'
+               '"prev":"%s","hash":"x"}' % ZERO).encode("utf-8")
+        self.assert_missing_at_line(row + b"\n", 1)
+
+    def test_non_standard_line_after_valid_record_is_first_bad_line(self):
+        payload = self._valid_row("x") + b'{"tenant": 1, "tenant": 2}\n'
+        self.assert_missing_at_line(payload, 2)
+
+    def test_earlier_semantic_error_beats_later_non_standard_line(self):
+        bad = {"tenant": "t", "seq": 2, "event": {}, "prev": ZERO}
+        bad["hash"] = AuditChain._hash(bad)
+        self._write_bytes(
+            (json.dumps(bad, sort_keys=True) + "\n").encode("utf-8")
+            + b"NaN\n")
+        r = self.chain.verify("t")
+        self.assertEqual((r["ok"], r["at"], r["reason"]),
+                         (False, 1, "sequence"))
+        r2 = self.chain.verify_all()
+        self.assertEqual(r2, {"ok": False, "at": 1,
+                              "tenant": "t", "reason": "sequence"})
+
+    def test_append_on_non_standard_history_raises_and_keeps_bytes(self):
+        self.chain.append("t", {})
+        before = self.path.read_bytes()
+        corrupt = before + b"NaN\n"
+        self._write_bytes(corrupt)
+        with self.assertRaises(AuditChainStateError) as cm:
+            self.chain.append("t", {})
+        # one good record -> next expected seq is 2; NaN is physical line 2
+        self.assertEqual((cm.exception.tenant, cm.exception.seq,
+                          cm.exception.reason, cm.exception.line),
+                         ("t", 2, "missing", 2))
+        self.assertEqual(self.path.read_bytes(), corrupt)
+
+    def test_standard_json_with_bad_fields_still_typed_same(self):
+        # standard JSON, missing hash -> missing with recoverable tenant
+        self.write([{"tenant": "t", "seq": 1, "event": {}, "prev": ZERO}])
+        self.assertEqual(self.chain.verify("t"),
+                         {"ok": False, "at": 1, "reason": "missing"})
+        self.assertEqual(self.chain.verify_all(),
+                         {"ok": False, "at": 1, "tenant": "t",
+                          "reason": "missing"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,81 @@
-import hashlib, json
+import hashlib, json, math
 from pathlib import Path
 
 ZERO = "0" * 64
 FIELDS = ("tenant", "seq", "event", "prev", "hash")
+
+
+def _reject_constant(name):
+    # The bare tokens NaN, Infinity and -Infinity are JavaScript extensions,
+    # not standard JSON, so a line containing one is unreadable corruption.
+    raise ValueError(f"non-standard JSON token: {name}")
+
+
+def _parse_finite_float(token):
+    # Same conversion as the default decoder, but an overflowed literal such
+    # as 1e309 (which parses to inf without ever hitting parse_constant) must
+    # be rejected instead of silently becoming Infinity.
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number: {token}")
+    return value
+
+
+def _reject_duplicate_keys(pairs):
+    # Fires bottom-up for every object, so duplicate keys in nested objects
+    # are caught too. A line with a repeated key has no unambiguous standard
+    # JSON meaning and is treated as missing-class corruption.
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+_STRICT_DECODER = json.JSONDecoder(
+    parse_constant=_reject_constant,
+    parse_float=_parse_finite_float,
+    object_pairs_hook=_reject_duplicate_keys,
+)
+
+
+def _loads_strict(raw):
+    # Parse exactly one standard JSON value. Trailing data and syntactically
+    # invalid content raise ValueError (JSONDecodeError is a ValueError
+    # subclass), as do duplicate object keys and any spelling that would
+    # decode to a non-finite number.
+    return _STRICT_DECODER.decode(raw)
+
+
+def _validate_json_value(value):
+    # Input boundary for append: null, booleans, finite integers and floats,
+    # strings, arrays and objects with string keys, recursively. NaN,
+    # Infinity, -Infinity, non-string object keys, tuples, bytes, sets and
+    # any other value without an unambiguous standard JSON encoding fail.
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if v is None or isinstance(v, (bool, int, str)):
+            continue
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                raise ValueError(
+                    "tenant and event must be standard JSON values: "
+                    "non-finite number is not allowed")
+        elif isinstance(v, list):
+            stack.extend(v)
+        elif isinstance(v, dict):
+            for key, sub in v.items():
+                if not isinstance(key, str):
+                    raise ValueError(
+                        "tenant and event must be standard JSON values: "
+                        "object keys must be strings")
+                stack.append(sub)
+        else:
+            raise ValueError(
+                "tenant and event must be standard JSON values: "
+                f"{type(v).__name__} cannot be encoded unambiguously")
 
 
 class AuditChainStateError(Exception):
@@ -80,8 +153,8 @@ class AuditChain:
         expected, prev, count = 1, ZERO, 0
         for line, raw in enumerate(lines, 1):
             try:
-                item = json.loads(raw)
-            except Exception:
+                item = _loads_strict(raw)
+            except ValueError:
                 raise _Broken("missing", None, line, expected)
             if not isinstance(item, dict) or "tenant" not in item:
                 raise _Broken("missing", None, line, expected)
@@ -105,6 +178,12 @@ class AuditChain:
         return count, prev
 
     def append(self, tenant, event):
+        # Validate the new inputs against the standard JSON boundary before
+        # touching the file at all: on a nonexistent, empty or non-empty file
+        # an invalid append must never write a byte, and this ValueError takes
+        # priority over any history scan or append action.
+        _validate_json_value(tenant)
+        _validate_json_value(event)
         data = self._read_bytes()
         lines, bad_line = self._decode_lines(data)
         try:
@@ -132,8 +211,8 @@ class AuditChain:
         lines, bad_line = self._decode_lines(self._read_bytes())
         for line, raw in enumerate(lines, 1):
             try:
-                item = json.loads(raw)
-            except Exception:
+                item = _loads_strict(raw)
+            except ValueError:
                 return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
             if not isinstance(item, dict) or "tenant" not in item:
                 return {"ok": False, "at": line, "tenant": None, "reason": "missing"}
