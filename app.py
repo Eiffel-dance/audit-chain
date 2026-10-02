@@ -68,6 +68,21 @@ def _strict_loads(raw):
     )
 
 
+def _validate_expected_count(expected_count):
+    # expected_count is an optional exact-length expectation: when given it
+    # must be a non-negative plain int. bool is rejected even though it is an
+    # int subclass, floats and other types are too, so the comparison below is
+    # always against an unambiguous integer.
+    if expected_count is None:
+        return
+    if isinstance(expected_count, bool) or not isinstance(expected_count, int) \
+            or expected_count < 0:
+        raise ValueError(
+            "expected_count must be a non-negative integer or None, got "
+            f"{expected_count!r}"
+        )
+
+
 class AuditChainStateError(Exception):
     def __init__(self, tenant, seq, reason=None, line=None):
         self.tenant = tenant
@@ -287,15 +302,11 @@ class AuditChain:
             f.write(block)
             return items
 
-    def verify_all(self):
-        # Validate every tenant chain in one read-only pass over the file, in
-        # physical line order. Each tenant gets an independent expected seq and
-        # prev digest starting at (1, ZERO) on first appearance; records of
-        # different tenants may interleave. The serialized tenant is only an
-        # internal key so distinct types (1 vs "1") stay separate chains while
-        # the original value is reported back unchanged. The shared lease
-        # pins the snapshot to a state wholly before or after any append.
-        data = self._read_snapshot()
+    def _verify_all_snapshot(self, data):
+        # Core of verify_all over an exact in-memory snapshot. Touches no path:
+        # the caller owns how the bytes were obtained (a shared-lease file read
+        # or a caller-supplied buffer), so the same logic backs both
+        # verify_all and the offline verify_all_bytes entry point.
         lines, bad_line = self._decode_lines(data)
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
@@ -330,6 +341,16 @@ class AuditChain:
             return {"ok": False, "at": bad_line, "tenant": None, "reason": "missing"}
         return {"ok": True,
                 "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
+
+    def verify_all(self):
+        # Validate every tenant chain in one read-only pass over the file, in
+        # physical line order. Each tenant gets an independent expected seq and
+        # prev digest starting at (1, ZERO) on first appearance; records of
+        # different tenants may interleave. The serialized tenant is only an
+        # internal key so distinct types (1 vs "1") stay separate chains while
+        # the original value is reported back unchanged. The shared lease
+        # pins the snapshot to a state wholly before or after any append.
+        return self._verify_all_snapshot(self._read_snapshot())
 
     def export_tenant(self, tenant):
         # Offline, single-tenant migration export. Returns UTF-8 bytes only:
@@ -370,17 +391,11 @@ class AuditChain:
                 )
         return b"".join(chunks)
 
-    def verify(self, tenant, expected_count=None):
-        # The tenant crosses the same standard-JSON input boundary as in
-        # append/append_batch, and it is checked before any history is read:
-        # NaN/Infinity/-Infinity, non-string object keys, cyclic containers
-        # and values without a standard JSON encoding raise ValueError here,
-        # never TypeError/RecursionError from a downstream json.dumps, and
-        # never a verdict computed against a corrupt or missing file. The
-        # file itself is opened read-only below, so a rejected call leaves
-        # every byte untouched and creates nothing.
-        _validate_json_value(tenant)
-        data = self._read_snapshot()
+    def _verify_snapshot(self, tenant, data, expected_count=None):
+        # Core of verify over an exact in-memory snapshot: the same JSON
+        # canonicalization, tenant identity and digest rules as the file path,
+        # but the bytes are given and never touched on disk. Backs both verify
+        # (file snapshot) and verify_bytes (caller snapshot).
         lines, bad_line = self._decode_lines(data)
         try:
             count, _ = self._scan(tenant, lines, bad_line)
@@ -392,3 +407,42 @@ class AuditChain:
             if count > expected_count:
                 return {"ok": False, "at": expected_count + 1, "reason": "sequence"}
         return {"ok": True, "count": count}
+
+    def verify(self, tenant, expected_count=None):
+        # The tenant crosses the same standard-JSON input boundary as in
+        # append/append_batch, and it is checked before any history is read:
+        # NaN/Infinity/-Infinity, non-string object keys, cyclic containers
+        # and values without a standard JSON encoding raise ValueError here,
+        # never TypeError/RecursionError from a downstream json.dumps, and
+        # never a verdict computed against a corrupt or missing file. The
+        # file itself is opened read-only below, so a rejected call leaves
+        # every byte untouched and creates nothing.
+        _validate_json_value(tenant)
+        return self._verify_snapshot(
+            tenant, self._read_snapshot(), expected_count
+        )
+
+    def verify_bytes(self, data, tenant, expected_count=None):
+        # Pure in-memory, offline entry point. The caller hands over the raw
+        # bytes of a JSONL history (a single-tenant export, or a full log with
+        # interleaved tenants); this never reads, creates or modifies the path
+        # this AuditChain points at and never touches the network. Results are
+        # byte-for-byte the same verdicts verify would give for identical file
+        # contents, including physical line numbers and first-error priority.
+        # Inputs cross their boundary before any parsing, and a malformed
+        # buffer surfaces only as a missing/sequence/digest verdict -- the
+        # underlying parse exception is never leaked.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        _validate_json_value(tenant)
+        _validate_expected_count(expected_count)
+        return self._verify_snapshot(tenant, data, expected_count)
+
+    def verify_all_bytes(self, data):
+        # In-memory counterpart of verify_all over a caller-supplied snapshot:
+        # same tenant first-appearance order, counts and first-error structure.
+        # Empty bytes are a legitimate successful empty history, and like
+        # verify_bytes this neither reads nor creates the configured path.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        return self._verify_all_snapshot(data)
