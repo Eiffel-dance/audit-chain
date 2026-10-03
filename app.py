@@ -69,6 +69,15 @@ def _strict_loads(raw):
     )
 
 
+def _is_json_int(value):
+    # A record's seq is a JSON integer only: the same plain-int shape append
+    # writes. bool is rejected even though it subclasses int, and a float is
+    # rejected even when it is numerically equal to the expected seq (1.0 or
+    # 1e0 is not the integer 1 the chain numbering produces); strings, null
+    # and every other type are likewise not sequence numbers.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _validate_expected_count(expected_count):
     # expected_count is an optional exact-length expectation: when given it
     # must be a non-negative plain int. bool is rejected even though it is an
@@ -278,7 +287,7 @@ class AuditChain:
                 seq = item.get("seq")
                 at = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
                 raise _Broken("missing", at, line, expected)
-            if isinstance(item["seq"], bool) or item["seq"] != expected:
+            if not _is_json_int(item["seq"]) or item["seq"] != expected:
                 raise _Broken("sequence", expected, line, expected)
             if item["prev"] != prev:
                 raise _Broken("digest", expected, line, expected)
@@ -319,7 +328,7 @@ class AuditChain:
                 seq = item.get("seq")
                 at = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
                 raise _Broken("missing", at, line, expected)
-            if isinstance(item["seq"], bool) or item["seq"] != expected:
+            if not _is_json_int(item["seq"]) or item["seq"] != expected:
                 raise _Broken("sequence", expected, line, expected)
             if item["prev"] != prev:
                 raise _Broken("digest", expected, line, expected)
@@ -885,7 +894,7 @@ class AuditChain:
                 states[key] = state
                 order.append((tenant, state))
             expected, prev, _ = state
-            if isinstance(item["seq"], bool) or item["seq"] != expected:
+            if not _is_json_int(item["seq"]) or item["seq"] != expected:
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "sequence"}
             if item["prev"] != prev:
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
