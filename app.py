@@ -577,6 +577,109 @@ class AuditChain:
         # pins the snapshot to a state wholly before or after any append.
         return self._verify_all_snapshot(self._read_snapshot())
 
+    def _import_scan(self, tenant, data):
+        # Full validation of an offline single-tenant history before any
+        # target byte is touched. Unlike _scan, nothing may be skipped: every
+        # physical line must parse as strict JSON, carry the five fields,
+        # belong to the *same* canonical JSON tenant identity, and link from
+        # (seq=1, prev=ZERO) with consecutive seqs and recomputed digests.
+        # A foreign-tenant record is a caller error (ValueError); structural
+        # failures are AuditChainStateError with the same tenant/seq/reason/
+        # line semantics as append/verify/export, raised at the first broken
+        # physical line. Returns the parsed records in physical order, which
+        # for a valid import is also ascending seq order.
+        key = self._tenant_key(tenant)
+        lines, bad_line = self._decode_lines(data)
+        expected, prev = 1, ZERO
+        items = []
+        for line, raw in enumerate(lines, 1):
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise AuditChainStateError(tenant, expected, "missing", line) from None
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise AuditChainStateError(tenant, expected, "missing", line)
+            if self._tenant_key(item["tenant"]) != key:
+                raise ValueError(
+                    f"import data mixes in another tenant at line {line}: "
+                    f"{item['tenant']!r}"
+                )
+            if any(k not in item for k in FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+                raise AuditChainStateError(
+                    tenant, at if at is not None else expected, "missing", line
+                )
+            if isinstance(item["seq"], bool) or item["seq"] != expected:
+                raise AuditChainStateError(tenant, expected, "sequence", line)
+            if item["prev"] != prev:
+                raise AuditChainStateError(tenant, expected, "digest", line)
+            if item["hash"] != self._hash(item):
+                raise AuditChainStateError(tenant, expected, "digest", line)
+            items.append(item)
+            prev = item["hash"]
+            expected += 1
+        if bad_line is not None:
+            raise AuditChainStateError(tenant, expected, "missing", bad_line)
+        return items
+
+    def import_tenant(self, tenant, data):
+        # Offline, network-free counterpart of export_tenant: restore a
+        # single-tenant history produced elsewhere (typically by
+        # export_tenant) into this log for migration or disaster recovery.
+        #
+        # Both arguments cross their boundary before any lease is taken, a
+        # path is probed or a single history byte is read: tenant uses the
+        # same standard-JSON boundary as append/verify/export, and data must
+        # be exactly bytes (bytearray/str and other types are ValueError),
+        # matching verify_bytes. An empty buffer is a no-op after that
+        # validation: it returns [] without creating the file, reading
+        # history or altering a byte, so the boundary errors still take
+        # priority over it.
+        _validate_json_value(tenant)
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        if not data:
+            return []
+        # The complete input chain is verified up front, outside the lease:
+        # every line must be strict UTF-8 JSONL belonging to this same
+        # canonical tenant, seqs must run 1..n from prev=ZERO and every
+        # digest must recompute. Only the parsed, verified records move on,
+        # so an invalid import never reaches the target.
+        items = self._import_scan(tenant, data)
+        chunks = [
+            json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            for item in items
+        ]
+        with self._write_lease() as f:
+            # Scan, conflict check and the block append run under one
+            # exclusive lease on the same description used for all three,
+            # exactly as append_batch does, so competing writes serialize and
+            # readers only ever observe the state wholly before or after the
+            # import. A corrupt target fails with the identical
+            # AuditChainStateError append would raise and takes priority over
+            # the conflict check; the import may proceed only when the target
+            # tenant's chain is empty, while other tenants' valid records may
+            # already interleave in the file.
+            target = f.read()
+            lines, bad_line = self._decode_lines(target)
+            try:
+                count, head = self._scan(tenant, lines, bad_line)
+            except _Broken as b:
+                seq = b.at if b.at is not None else b.expect
+                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+            if count != 0:
+                raise AuditChainConflictError(tenant, 0, ZERO, count, head)
+            # One O_APPEND write places the whole history atomically. The
+            # imported records keep their original tenant value, seq, event,
+            # prev and hash: nothing is renumbered or re-linked, so the bytes
+            # verify with unchanged semantics even though other tenants may
+            # already precede them in the file.
+            prefix = b"" if (not target or target.endswith(b"\n")) else b"\n"
+            block = prefix + "".join(chunks).encode("utf-8")
+            f.write(block)
+            return items
+
     def export_tenant(self, tenant):
         # Offline, single-tenant migration export. Returns UTF-8 bytes only:
         # it never creates, mutates or deletes any path and never touches the
