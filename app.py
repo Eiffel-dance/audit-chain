@@ -663,11 +663,13 @@ class AuditChain:
             f.write(prefix + "".join(chunks).encode("utf-8"))
             return items
 
-    def _verify_all_snapshot(self, data):
-        # Core of verify_all over an exact in-memory snapshot. Touches no path:
-        # the caller owns how the bytes were obtained (a shared-lease file read
-        # or a caller-supplied buffer), so the same logic backs both
-        # verify_all and the offline verify_all_bytes entry point.
+    def _heads_snapshot(self, data):
+        # Core of heads over an exact in-memory snapshot. Touches no path:
+        # the caller owns how the bytes were obtained (a shared-lease file
+        # read), so the same scan also backs verify_all/verify_all_bytes via
+        # _verify_all_snapshot below. Failure dicts are byte-for-byte the
+        # ones verify_all produces; the success payload additionally carries
+        # each tenant's verified head hash.
         lines, bad_line = self._decode_lines(data)
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
@@ -701,7 +703,23 @@ class AuditChain:
             # First undecodable byte: tenant cannot be parsed, so None.
             return {"ok": False, "at": bad_line, "tenant": None, "reason": "missing"}
         return {"ok": True,
-                "tenants": [{"tenant": t, "count": s[2]} for t, s in order]}
+                "tenants": [{"tenant": t, "count": s[2], "hash": s[1]}
+                            for t, s in order]}
+
+    def _verify_all_snapshot(self, data):
+        # Core of verify_all over an exact in-memory snapshot. Touches no path:
+        # the caller owns how the bytes were obtained (a shared-lease file read
+        # or a caller-supplied buffer), so the same logic backs both
+        # verify_all and the offline verify_all_bytes entry point. Shares the
+        # heads scan and drops the head hashes from the success payload, so
+        # verify_all's result shape is unchanged.
+        result = self._heads_snapshot(data)
+        if result["ok"]:
+            result["tenants"] = [
+                {"tenant": t["tenant"], "count": t["count"]}
+                for t in result["tenants"]
+            ]
+        return result
 
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
@@ -712,6 +730,48 @@ class AuditChain:
         # the original value is reported back unchanged. The shared lease
         # pins the snapshot to a state wholly before or after any append.
         return self._verify_all_snapshot(self._read_snapshot())
+
+    def head(self, tenant):
+        # Read-only chain-head query: the verified (count, hash) tail of one
+        # tenant, ready to be asserted back through append_if_head or
+        # append_batch_if_head without the caller re-reading the log. The
+        # tenant crosses the exact standard-JSON input boundary of
+        # append/verify/export before any byte is read, so an illegal value
+        # raises ValueError without touching the log, under any contention.
+        _validate_json_value(tenant)
+        # One shared-lease snapshot, exactly as verify/export use: the result
+        # describes the complete state wholly before or wholly after any
+        # concurrent append, never a torn chain; a later race is left to the
+        # conditional append's own conflict semantics. A missing or empty
+        # log, or a tenant with no records, is a legitimate empty chain and
+        # yields count 0 with the ZERO head. The whole physical log is
+        # scanned with the same identity/sequence/digest rules as verify, so
+        # a corrupt prefix or tail raises AuditChainStateError (same
+        # tenant/seq/reason/line as append/export_tenant, reason only
+        # missing/sequence/digest) instead of returning an unverifiable
+        # head; nothing is created, modified or cached.
+        data = self._read_snapshot()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            count, head = self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        return {"tenant": tenant, "count": count, "hash": head}
+
+    def heads(self):
+        # Read-only head query for every tenant at once. Takes no argument
+        # and validates all chains in the same single shared-lease snapshot
+        # verify_all uses, so the result is the complete state wholly before
+        # or wholly after any concurrent append. On success returns
+        # {"ok": True, "tenants": [...]} with one entry per tenant in
+        # first-appearance physical order, each carrying the original tenant
+        # value, its verified count and its head hash; an empty or missing
+        # log yields an empty array. The first defect in physical line order
+        # is reported with the exact failure fields verify_all produces and
+        # no partial heads are returned. Read-only: creates nothing,
+        # modifies nothing, caches nothing.
+        return self._heads_snapshot(self._read_snapshot())
 
     def export_tenant(self, tenant):
         # Offline, single-tenant migration export. Returns UTF-8 bytes only:
