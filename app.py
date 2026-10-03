@@ -278,7 +278,15 @@ class AuditChain:
                 seq = item.get("seq")
                 at = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
                 raise _Broken("missing", at, line, expected)
-            if isinstance(item["seq"], bool) or item["seq"] != expected:
+            seq = item["seq"]
+            # The seq of a stored record must be a JSON integer exactly equal
+            # to the next expected one: append only ever writes plain ints,
+            # so a bool, a float spelling (1.0, 1e0 -- host-language loose
+            # equality must not admit them), a string, null, an array/object
+            # or any mismatching integer is a sequence defect, never a valid
+            # record, and is never renumbered, skipped or rewritten.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
                 raise _Broken("sequence", expected, line, expected)
             if item["prev"] != prev:
                 raise _Broken("digest", expected, line, expected)
@@ -319,7 +327,12 @@ class AuditChain:
                 seq = item.get("seq")
                 at = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
                 raise _Broken("missing", at, line, expected)
-            if isinstance(item["seq"], bool) or item["seq"] != expected:
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as _scan: a float spelling
+            # (1.0, 1e0), bool, string, null, array/object or a mismatching
+            # integer is a sequence defect, never renumbered or skipped.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
                 raise _Broken("sequence", expected, line, expected)
             if item["prev"] != prev:
                 raise _Broken("digest", expected, line, expected)
@@ -885,7 +898,12 @@ class AuditChain:
                 states[key] = state
                 order.append((tenant, state))
             expected, prev, _ = state
-            if isinstance(item["seq"], bool) or item["seq"] != expected:
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as _scan: 1.0/1e0, bools,
+            # strings, null, arrays/objects and mismatching integers are all
+            # sequence defects, so file and memory scans agree exactly.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "sequence"}
             if item["prev"] != prev:
                 return {"ok": False, "at": line, "tenant": tenant, "reason": "digest"}
