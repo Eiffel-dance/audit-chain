@@ -416,6 +416,96 @@ class AuditChain:
             f.write(block)
             return items
 
+    def append_many(self, entries):
+        # Cross-tenant atomic append: entries is a list whose every member
+        # must be an object carrying exactly the keys "tenant" and "event"
+        # (no missing, no extra, no non-string keys), in the order the
+        # records are to be written. A non-list argument, a member of any
+        # other shape or a member with a different key set is a ValueError,
+        # as is any tenant/event outside the standard-JSON boundary append
+        # uses. All of this is checked before a path is touched, a lease is
+        # taken or a byte of history is read, so a malformed call raises
+        # ValueError without creating or changing anything, under any
+        # contention. An empty list is a no-op after validation: nothing is
+        # created, read or changed.
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"entries must be a list, got {type(entries).__name__}"
+            )
+        for entry in entries:
+            if not isinstance(entry, dict) \
+                    or set(entry) != {"tenant", "event"}:
+                raise ValueError(
+                    "each entry must be an object with exactly the keys "
+                    f"'tenant' and 'event', got {entry!r}"
+                )
+            _validate_json_value(entry["tenant"])
+            _validate_json_value(entry["event"])
+        if not entries:
+            return []
+        with self._write_lease() as f:
+            # One exclusive lease covers the scans of every involved tenant
+            # and the single block write, so the whole group commits as one
+            # indivisible byte interval: competing writers serialize wholly
+            # before or after it, and shared-lease readers only ever observe
+            # the state wholly before or wholly after it.
+            data = f.read()
+            lines, bad_line = self._decode_lines(data)
+            # Validate each involved tenant's chain with the exact scan
+            # append runs, in the order the tenant first appears in the
+            # input. Every chain is scanned even after a failure is found:
+            # when several affected chains are broken, the error reported is
+            # the one at the earliest physical line of the log, and ties are
+            # broken by input order. Nothing is written on any failure path.
+            states = {}   # canonical tenant key -> (count, prev)
+            order = []    # (key, tenant) in input first-appearance order
+            for entry in entries:
+                key = self._tenant_key(entry["tenant"])
+                if key not in states:
+                    states[key] = None
+                    order.append((key, entry["tenant"]))
+            first_error = None  # (line, tenant, _Broken); order[] breaks ties
+            for key, tenant in order:
+                try:
+                    states[key] = self._scan(tenant, lines, bad_line)
+                except _Broken as b:
+                    if first_error is None or b.line < first_error[0]:
+                        first_error = (b.line, tenant, b)
+            if first_error is not None:
+                _, tenant, b = first_error
+                seq = b.at if b.at is not None else b.expect
+                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+            # Every prior chain state is valid. Records are generated in
+            # input order: repeated tenants number consecutively in order of
+            # appearance, each tenant's first record continues the chain tail
+            # found on disk, and each later one links to the previous record
+            # of the same tenant inside this group -- the same fields, seq
+            # numbering, prev digest and hash algorithm as append.
+            items = []
+            chunks = []
+            for entry in entries:
+                key = self._tenant_key(entry["tenant"])
+                count, prev = states[key]
+                item = {"tenant": entry["tenant"], "seq": count + 1,
+                        "event": entry["event"], "prev": prev}
+                item["hash"] = self._hash(item)
+                items.append(item)
+                chunks.append(
+                    json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                )
+                states[key] = (count + 1, item["hash"])
+            # One O_APPEND write places the whole group atomically at the
+            # current end of file, in input order; under the exclusive lease
+            # no other writer moves that end, and no existing byte can be
+            # overwritten. The file is only ever created on this success
+            # path: a not-yet-existing log has no history that could fail
+            # the scans above, and every boundary error returned before the
+            # lease was taken.
+            prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+            block = prefix + "".join(chunks).encode("utf-8")
+            f.write(block)
+            return items
+
     def _append_batch_if_head_locked(self, f, tenant, events,
                                      expected_count, expected_hash):
         # Scan, compare and append on a description already holding the
