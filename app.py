@@ -147,6 +147,13 @@ class _Broken(Exception):
         self.reason, self.at, self.line, self.expect = reason, at, line, expect
 
 
+class _ForeignTenant(Exception):
+    # Internal: an import stream that must contain exactly one tenant's
+    # history carried a record of another canonical JSON identity.
+    def __init__(self, line):
+        self.line = line
+
+
 class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
@@ -283,6 +290,47 @@ class AuditChain:
         if bad_line is not None:
             raise _Broken("missing", None, bad_line, expected)
         return count, prev
+
+    def _scan_import(self, tenant, lines, bad_line=None):
+        # Validate an offline single-tenant export before it is grafted onto
+        # another log. Unlike _scan, no foreign records are tolerated: every
+        # physical line must be a well-formed record carrying the exact same
+        # canonical JSON tenant identity, seqs must run 1..n from a ZERO prev,
+        # and each digest must verify. Returns the parsed records in physical
+        # (== seq) order. A chain defect raises _Broken with the same
+        # reason/at/line/expect filling rules _scan uses, so the resulting
+        # AuditChainStateError is shaped exactly like append's; a record of
+        # another tenant identity violates the single-tenant input contract
+        # and raises _ForeignTenant (surfaced as ValueError by import_tenant),
+        # with the first problem in physical order taking priority.
+        key = self._tenant_key(tenant)
+        records = []
+        expected, prev = 1, ZERO
+        for line, raw in enumerate(lines, 1):
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise _Broken("missing", None, line, expected)
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise _Broken("missing", None, line, expected)
+            if self._tenant_key(item["tenant"]) != key:
+                raise _ForeignTenant(line)
+            if any(k not in item for k in FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+                raise _Broken("missing", at, line, expected)
+            if isinstance(item["seq"], bool) or item["seq"] != expected:
+                raise _Broken("sequence", expected, line, expected)
+            if item["prev"] != prev:
+                raise _Broken("digest", expected, line, expected)
+            if item["hash"] != self._hash(item):
+                raise _Broken("digest", expected, line, expected)
+            records.append(item)
+            prev = item["hash"]
+            expected += 1
+        if bad_line is not None:
+            raise _Broken("missing", None, bad_line, expected)
+        return records
 
     def append(self, tenant, event):
         # Validate the new input against the standard-JSON boundary before
@@ -615,6 +663,79 @@ class AuditChain:
                     .encode("utf-8")
                 )
         return b"".join(chunks)
+
+    def import_tenant(self, tenant, data):
+        # Offline counterpart of export_tenant: graft a single-tenant export
+        # (or any strictly valid single-tenant JSONL history) onto this log
+        # without a network or remote anchor. The records keep their original
+        # tenant/seq/event/prev/hash values verbatim -- nothing is renumbered
+        # or recomputed -- so verify/verify_all/verify_bytes/export_tenant
+        # validate the merged log by the exact existing rules.
+        #
+        # Boundary first, exactly as every other entry point orders it: the
+        # tenant crosses the standard-JSON boundary and data must be bytes,
+        # both before any lease is taken, any history is read or the path is
+        # probed, so an illegal call raises ValueError regardless of target
+        # state or contention and creates nothing. Empty bytes are a no-op
+        # after that validation: no file is created, no history is read and
+        # no byte changes.
+        _validate_json_value(tenant)
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        if not data:
+            return []
+        # The complete input chain is verified before the target is ever
+        # touched: strict UTF-8 JSONL, this exact canonical tenant identity on
+        # every physical line, seq starting at 1 with prev ZERO and each
+        # digest matching. A chain defect raises AuditChainStateError --
+        # reason missing/sequence/digest, with tenant, seq and physical line
+        # filled as append fills them; a record of any other tenant identity
+        # violates the single-tenant input contract and raises ValueError.
+        # Either kind reaches the caller before a target-side check can.
+        lines, bad_line = self._decode_lines(data)
+        try:
+            records = self._scan_import(tenant, lines, bad_line)
+        except _ForeignTenant as ft:
+            raise ValueError(
+                f"import data must contain only tenant {tenant!r}; "
+                f"a record of another tenant appears at line {ft.line}"
+            ) from None
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        with self._write_lease() as f:
+            # Target validation and the append share one exclusive lease on
+            # the description used for both, so the graft is indivisible:
+            # competing writers serialize wholly before or after it. A corrupt
+            # target is reported exactly as append reports it and takes
+            # priority over the emptiness assertion; a target that already
+            # holds a record for this tenant is a conflict -- an import can
+            # only land on an empty chain for that tenant -- with the fixed
+            # empty-head expectation (0, ZERO) and the observed tail as
+            # actual_*. Other tenants' valid records may already be present.
+            target = f.read()
+            t_lines, t_bad = self._decode_lines(target)
+            try:
+                count, head = self._scan(tenant, t_lines, t_bad)
+            except _Broken as b:
+                seq = b.at if b.at is not None else b.expect
+                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+            if count != 0:
+                raise AuditChainConflictError(
+                    tenant, 0, ZERO, count, head
+                )
+            # One O_APPEND write commits the whole history as a single block,
+            # re-serialized with the exact rule append/export use. The first
+            # imported record has prev ZERO, so it links directly into the
+            # empty target chain regardless of the other tenants interleaved
+            # on disk; seqs and hashes stay exactly the validated ones.
+            chunks = [
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                for item in records
+            ]
+            prefix = b"" if (not target or target.endswith(b"\n")) else b"\n"
+            f.write(prefix + "".join(chunks).encode("utf-8"))
+            return records
 
     def read_tenant(self, tenant, start_seq=1, page_size=None):
         # Read-only, single-tenant paged view. Returns plain record dicts
