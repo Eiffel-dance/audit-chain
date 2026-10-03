@@ -403,6 +403,52 @@ class AuditChain:
         f.write(record)
         return item
 
+    def _append_batch_if_head_locked(self, f, tenant, events,
+                                     expected_count, expected_hash):
+        # Batch twin of _append_if_head_locked: scan, compare the asserted
+        # head and build-plus-append the whole batch on one description that
+        # already holds the exclusive data-file lease. A corrupt history is
+        # reported exactly as append_batch reports it and the assertion is
+        # never evaluated against an unverifiable chain; a well-formed but
+        # mismatching head is a conflict. Nothing is written on either
+        # failure path, so a rejected batch leaves no partial records.
+        data = f.read()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            count, head = self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # _scan returns ZERO for an empty chain, so an empty history is
+        # compared by the exact same rule as a non-empty one: the batch
+        # proceeds only when both the length and the tail digest match.
+        if count != expected_count or head != expected_hash:
+            raise AuditChainConflictError(
+                tenant, expected_count, expected_hash, count, head
+            )
+        # Head confirmed. Build the batch exactly as append_batch would
+        # against the same history: the first record continues the confirmed
+        # head, every later record links to the previous record inside the
+        # batch, seqs are contiguous from expected_count + 1, and the whole
+        # batch is one byte block -- byte-for-byte identical to that many
+        # plain appends made against the same head.
+        items = []
+        chunks = []
+        for event in events:
+            item = {"tenant": tenant, "seq": count + 1,
+                    "event": event, "prev": head}
+            item["hash"] = self._hash(item)
+            items.append(item)
+            chunks.append(
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            )
+            count += 1
+            head = item["hash"]
+        prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+        block = prefix + "".join(chunks).encode("utf-8")
+        f.write(block)
+        return items
+
     def append_if_head(self, tenant, event, expected_count, expected_hash):
         # Conditional append behind an optimistic head assertion. Every input
         # crosses its boundary before a lease is taken, a path is probed or a
@@ -452,6 +498,71 @@ class AuditChain:
                 # confirms the empty head it was allowed to create for.
                 return self._append_if_head_locked(
                     f, tenant, event, expected_count, expected_hash
+                )
+            finally:
+                f.flush()
+                f.close()
+
+    def append_batch_if_head(self, tenant, events,
+                             expected_count, expected_hash):
+        # Atomic batch append behind an optimistic head assertion: the batch
+        # validation-read, head comparison and the whole batch commit are one
+        # indivisible lease. Every input crosses its boundary before a lease
+        # is taken, a path is probed or a single byte is read: events must be
+        # a list (a bare JSON value, including a string, is not a batch) whose
+        # elements and the tenant use the same standard-JSON boundary as
+        # append_batch/append_if_head; expected_count must be a non-negative
+        # plain int (bool, negative, float and other types are ValueError);
+        # expected_hash must be exactly the 64 lowercase hex characters of a
+        # sha256 digest (the empty-chain head is asserted with ZERO). An empty
+        # list is a no-op that returns [] and, like every rejected call,
+        # creates no file and touches no byte -- the parameters are still
+        # validated first, so an empty batch with malformed parameters raises
+        # ValueError exactly as a non-empty one would.
+        if not isinstance(events, list):
+            raise ValueError(
+                f"events must be a list, got {type(events).__name__}"
+            )
+        _validate_json_value(tenant)
+        for event in events:
+            _validate_json_value(event)
+        _validate_required_count(expected_count)
+        _validate_expected_hash(expected_hash)
+        if not events:
+            return []
+        # Leases follow append_if_head exactly. On an existing log the
+        # ordinary data-file lease covers scan, compare and the block write;
+        # before the log exists, the directory lease -- the same one ordinary
+        # appends hold while creating the file -- guards the whole
+        # missing-file branch, so the existence probe, the empty-chain
+        # comparison and a winning file creation are indivisible relative to
+        # every other writer. Lock order stays directory-then-data.
+        with self._dir_lease():
+            try:
+                f = open(self.path, "r+b")
+            except FileNotFoundError:
+                # Definitive empty chain for every tenant: no other writer
+                # can create the path while this lease is held. Only an exact
+                # (0, ZERO) assertion may create the log for a non-empty
+                # batch; any other head is a deterministic conflict and must
+                # leave no file behind.
+                if expected_count != 0 or expected_hash != ZERO:
+                    raise AuditChainConflictError(
+                        tenant, expected_count, expected_hash, 0, ZERO
+                    )
+                f = open(self.path, "a+b")
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                # Assertions against the same head serialize here: one batch
+                # appends and observes (count, head), every other observes the
+                # winner's new tail and gets the conflict carrying the actual
+                # post-win values, no byte written by a losing call. The
+                # winning block is itself indivisible: other-tenant appends
+                # land wholly before or after it, and shared-lock readers see
+                # only the pre- or post-commit snapshot.
+                return self._append_batch_if_head_locked(
+                    f, tenant, events, expected_count, expected_hash
                 )
             finally:
                 f.flush()
