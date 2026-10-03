@@ -998,6 +998,82 @@ class AuditChain:
                 )
         return b"".join(chunks)
 
+    def _check_all_chains(self, data):
+        # Validate every tenant chain over one exact in-memory snapshot, in
+        # physical line order, and raise AuditChainStateError at the first
+        # defect. Backs export_all: the identity, strict-seq, prev and digest
+        # rules are exactly the ones verify_all applies, but a failure is
+        # reported as the append/verify-style exception (tenant, seq, reason,
+        # line; reason only missing/sequence/digest) instead of a verdict
+        # dict. A line that cannot be parsed at all belongs to no
+        # determinable tenant, so tenant and seq are None there -- the same
+        # "unknown tenant" situation verify_all reports as tenant None.
+        lines, bad_line = self._decode_lines(data)
+        states = {}  # serialized tenant -> [expected_seq, prev_hash]
+        for line, raw in enumerate(lines, 1):
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise AuditChainStateError(None, None, "missing", line) from None
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise AuditChainStateError(None, None, "missing", line) from None
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            state = states.get(key)
+            if state is None:
+                state = [1, ZERO]
+                states[key] = state
+            expected, prev = state
+            if any(k not in item for k in FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) and not isinstance(seq, bool) \
+                    else expected
+                raise AuditChainStateError(tenant, at, "missing", line) from None
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as _scan: 1.0/1e0, bools,
+            # strings, null, arrays/objects and mismatching integers are all
+            # sequence defects, never renumbered or skipped.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
+                raise AuditChainStateError(
+                    tenant, expected, "sequence", line) from None
+            if item["prev"] != prev:
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            if item["hash"] != self._hash(item):
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            state[0] += 1
+            state[1] = item["hash"]
+        if bad_line is not None:
+            # First undecodable byte: tenant cannot be parsed, so None.
+            raise AuditChainStateError(None, None, "missing", bad_line) from None
+
+    def export_all(self):
+        # Offline, whole-log migration export: the multi-tenant counterpart
+        # of export_tenant. Returns the log's current UTF-8 bytes verbatim --
+        # every tenant's records in their physical interleaved order -- and
+        # never creates, mutates or deletes any path and never touches the
+        # network. Takes no arguments, so no input boundary applies.
+        #
+        # One shared-lease snapshot pins the export to a state wholly before
+        # or wholly after some append: a concurrent writer can never land in
+        # the middle of it, and the returned bytes are exactly that snapshot.
+        # A missing or empty log is a legitimate empty snapshot and yields
+        # b"". Before anything is returned, every tenant chain in the
+        # snapshot is validated with the exact identity, sequence and digest
+        # rules of verify_all: an unparseable physical line (strict UTF-8 and
+        # standard JSON only -- duplicate keys and non-standard numbers
+        # included), a missing field, a sequence gap, a wrong prev digest or
+        # a wrong record hash anywhere raises AuditChainStateError locating
+        # the first corruption in physical line order (tenant, seq, reason,
+        # line; reason only missing/sequence/digest), and no partial result
+        # is ever returned. The file is opened read-only and no byte of it
+        # changes either way.
+        data = self._read_snapshot()
+        self._check_all_chains(data)
+        return data
+
     def import_tenant(self, tenant, data):
         # Offline counterpart of export_tenant: graft a single-tenant export
         # (or any strictly valid single-tenant JSONL history) onto this log
@@ -1063,6 +1139,146 @@ class AuditChain:
             # imported record has prev ZERO, so it links directly into the
             # empty target chain regardless of the other tenants interleaved
             # on disk; seqs and hashes stay exactly the validated ones.
+            chunks = [
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                for item in records
+            ]
+            prefix = b"" if (not target or target.endswith(b"\n")) else b"\n"
+            f.write(prefix + "".join(chunks).encode("utf-8"))
+            return records
+
+    def _parse_import_all(self, data):
+        # Validate a multi-tenant import buffer completely in memory, before
+        # the target is ever touched. Every physical line must be strict
+        # UTF-8 standard JSON (duplicate keys and non-standard numbers
+        # rejected by _strict_loads), an object carrying exactly the five
+        # existing fields, and each tenant's records -- freely interleaved
+        # with other tenants' -- must form a contiguous chain numbered from
+        # seq 1 and anchored at prev ZERO with every digest recomputing.
+        # Returns (records, order): the parsed record dicts in physical
+        # order, and the involved tenants as (canonical_key, tenant_value)
+        # in first-appearance order. A defect raises AuditChainStateError
+        # with the input's physical line number: parse failures, missing or
+        # extra fields, duplicate keys, non-standard numbers and illegal
+        # UTF-8 are missing, sequence problems are sequence, a wrong prev or
+        # hash is digest; a line that cannot be parsed at all belongs to no
+        # determinable tenant, so tenant and seq are None there.
+        lines, bad_line = self._decode_lines(data)
+        states = {}  # serialized tenant -> [expected_seq, prev_hash]
+        order = []   # (canonical_key, tenant_value) in first-appearance order
+        records = []
+        for line, raw in enumerate(lines, 1):
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise AuditChainStateError(None, None, "missing", line) from None
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise AuditChainStateError(None, None, "missing", line) from None
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            state = states.get(key)
+            if state is None:
+                state = [1, ZERO]
+                states[key] = state
+                order.append((key, tenant))
+            expected, prev = state
+            if len(item) != len(FIELDS) or any(k not in item for k in FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) and not isinstance(seq, bool) \
+                    else expected
+                raise AuditChainStateError(tenant, at, "missing", line) from None
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as _scan_import: 1.0/1e0,
+            # bools, strings, null, arrays/objects and mismatching integers
+            # are all sequence defects, never renumbered or skipped.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
+                raise AuditChainStateError(
+                    tenant, expected, "sequence", line) from None
+            if item["prev"] != prev:
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            if item["hash"] != self._hash(item):
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            records.append(item)
+            state[0] += 1
+            state[1] = item["hash"]
+        if bad_line is not None:
+            raise AuditChainStateError(None, None, "missing", bad_line) from None
+        return records, order
+
+    def import_all(self, data):
+        # Offline counterpart of export_all: graft a whole multi-tenant JSONL
+        # snapshot (tenants freely interleaved) onto this log as one
+        # indivisible block, without a network or remote anchor. The records
+        # keep their original tenant/seq/event/prev/hash values verbatim --
+        # nothing is renumbered or recomputed -- so verify/verify_all/
+        # verify_bytes/export_all validate the merged log by the exact
+        # existing rules.
+        #
+        # Boundary first, exactly as every other entry point orders it: data
+        # must be bytes, checked before any lease is taken, any history is
+        # read or the path is probed, so an illegal call raises ValueError
+        # regardless of target state or contention and creates nothing.
+        # Empty bytes are a no-op after that check: no file is created, no
+        # history is read and no byte changes.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        if not data:
+            return []
+        # The complete input is verified before the target is ever touched
+        # (see _parse_import_all): strict UTF-8 JSONL, exactly the five
+        # existing fields per record, every tenant's chain running 1..n from
+        # a ZERO prev with each digest matching. Any defect raises
+        # AuditChainStateError with the input's physical line number and
+        # reaches the caller before a target-side check can.
+        records, order = self._parse_import_all(data)
+        with self._write_lease() as f:
+            # Target validation and the append share one exclusive lease on
+            # the description used for both, so check-and-commit is one
+            # atomic operation: competing writers serialize wholly before or
+            # after it. Only the tenants the input involves are scanned --
+            # each with the exact full-chain scan append runs -- and an
+            # uninvolved tenant's own damage never blocks the import. A
+            # corrupt involved chain is reported exactly as append reports
+            # it (first physical line deciding across chains, then input
+            # first-appearance order) and takes priority over the emptiness
+            # assertion.
+            target = f.read()
+            t_lines, t_bad = self._decode_lines(target)
+            heads = {}   # serialized tenant -> (count, head)
+            broken = []  # (line, first_input_index, AuditChainStateError)
+            for idx, (key, tenant) in enumerate(order):
+                try:
+                    heads[key] = self._scan(tenant, t_lines, t_bad)
+                except _Broken as b:
+                    seq = b.at if b.at is not None else b.expect
+                    broken.append((
+                        b.line, idx,
+                        AuditChainStateError(tenant, seq, b.reason, b.line),
+                    ))
+            if broken:
+                raise min(broken, key=lambda x: (x[0], x[1]))[2] from None
+            # Every involved target chain is valid. An import can only land
+            # on chains that are all still empty: the first involved tenant
+            # in input first-appearance order that already holds records is
+            # a conflict with the fixed empty-head expectation (0, ZERO) and
+            # the observed tail as actual_*. No byte is written on this path.
+            for key, tenant in order:
+                count, head = heads[key]
+                if count != 0:
+                    raise AuditChainConflictError(
+                        tenant, 0, ZERO, count, head
+                    )
+            # One O_APPEND write commits the whole snapshot as a single
+            # block, re-serialized with the exact rule append/export use.
+            # Every imported chain anchors at ZERO, so each links directly
+            # into its empty target chain regardless of the other tenants
+            # interleaved on disk; seqs and hashes stay exactly the
+            # validated ones. The file is created by this lease only now
+            # that every check has passed, and a missing trailing newline on
+            # the target is healed exactly the way append heals it.
             chunks = [
                 json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
                 for item in records
