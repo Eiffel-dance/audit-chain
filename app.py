@@ -368,8 +368,8 @@ class AuditChain:
             f.write(block)
             return items
 
-    def _append_if_head_locked(self, f, tenant, event,
-                               expected_count, expected_hash):
+    def _append_batch_if_head_locked(self, f, tenant, events,
+                                     expected_count, expected_hash):
         # Scan, compare and append on a description already holding the
         # exclusive data-file lease. A corrupt history is reported exactly as
         # append reports it and the assertion is never evaluated against an
@@ -389,45 +389,53 @@ class AuditChain:
             raise AuditChainConflictError(
                 tenant, expected_count, expected_hash, count, head
             )
-        # Head confirmed. The record uses the identical fields, seq numbering,
-        # prev digest and hash algorithm as append.
-        item = {"tenant": tenant, "seq": count + 1, "event": event, "prev": head}
-        item["hash"] = self._hash(item)
-        # One O_APPEND write places the whole record atomically at the
+        # Head confirmed. The records use the identical fields, seq numbering,
+        # prev digest and hash algorithm as append: the first continues the
+        # asserted chain head, each later one links to the previous record of
+        # the batch, exactly as append_batch links its records.
+        items = []
+        chunks = []
+        prev = head
+        for event in events:
+            item = {"tenant": tenant, "seq": count + 1,
+                    "event": event, "prev": prev}
+            item["hash"] = self._hash(item)
+            items.append(item)
+            chunks.append(
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            )
+            count += 1
+            prev = item["hash"]
+        # One O_APPEND write places the whole batch atomically at the
         # current end of file; under the exclusive lease no other writer
         # moves that end, and no existing byte can be overwritten.
         prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
-        record = prefix + (
-            json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
-        ).encode("utf-8")
-        f.write(record)
-        return item
+        block = prefix + "".join(chunks).encode("utf-8")
+        f.write(block)
+        return items
 
-    def append_if_head(self, tenant, event, expected_count, expected_hash):
-        # Conditional append behind an optimistic head assertion. Every input
-        # crosses its boundary before a lease is taken, a path is probed or a
-        # single byte is read: tenant/event use the same standard-JSON
-        # boundary as append, expected_count must be a non-negative plain int
-        # (bool, negative, float and other types are ValueError), and
-        # expected_hash must be exactly the 64 lowercase hex characters of a
-        # sha256 digest (the empty-chain head is asserted with ZERO). A
-        # malformed call ends here, creates nothing and never depends on
-        # contention or history.
-        _validate_json_value(tenant)
-        _validate_json_value(event)
-        _validate_required_count(expected_count)
-        _validate_expected_hash(expected_hash)
-        # One exclusive lease covers validation-read, comparison and the
-        # write. On an existing log that is the ordinary data-file lease;
-        # before the log exists, the data-file lock cannot be taken without
-        # creating the path (and a losing assertion must leave no file), so
-        # the directory lease -- the same one ordinary appends hold while
-        # creating the file -- guards the whole missing-file branch. The
-        # existence probe, the empty-chain comparison and a winning creation
-        # are therefore indivisible relative to every other writer. Lock
-        # order is always directory-then-data, so the nesting cannot
-        # deadlock against a plain append. _dir_lease also ensures the
-        # parent directory exists.
+    def _append_if_head_locked(self, f, tenant, event,
+                               expected_count, expected_hash):
+        # Single-event special case of the batch conditional append; the
+        # shared helper keeps the scan, comparison, serialization and write
+        # rules of both entry points byte-for-byte identical.
+        return self._append_batch_if_head_locked(
+            f, tenant, [event], expected_count, expected_hash
+        )[0]
+
+    @contextlib.contextmanager
+    def _head_lease(self, tenant, expected_count, expected_hash):
+        # One exclusive lease covering validation-read, head comparison and
+        # the write of a conditional append. On an existing log that is the
+        # ordinary data-file lease; before the log exists, the data-file lock
+        # cannot be taken without creating the path (and a losing assertion
+        # must leave no file), so the directory lease -- the same one ordinary
+        # appends hold while creating the file -- guards the whole
+        # missing-file branch. The existence probe, the empty-chain
+        # comparison and a winning creation are therefore indivisible
+        # relative to every other writer. Lock order is always
+        # directory-then-data, so the nesting cannot deadlock against a plain
+        # append. _dir_lease also ensures the parent directory exists.
         with self._dir_lease():
             try:
                 f = open(self.path, "r+b")
@@ -450,12 +458,74 @@ class AuditChain:
                 # conflict with the actual values, no byte written by a
                 # losing call. When this call just created the file the scan
                 # confirms the empty head it was allowed to create for.
-                return self._append_if_head_locked(
-                    f, tenant, event, expected_count, expected_hash
-                )
+                yield f
             finally:
                 f.flush()
                 f.close()
+
+    def append_if_head(self, tenant, event, expected_count, expected_hash):
+        # Conditional append behind an optimistic head assertion. Every input
+        # crosses its boundary before a lease is taken, a path is probed or a
+        # single byte is read: tenant/event use the same standard-JSON
+        # boundary as append, expected_count must be a non-negative plain int
+        # (bool, negative, float and other types are ValueError), and
+        # expected_hash must be exactly the 64 lowercase hex characters of a
+        # sha256 digest (the empty-chain head is asserted with ZERO). A
+        # malformed call ends here, creates nothing and never depends on
+        # contention or history. The lease itself (and its missing-file
+        # branch) is shared with append_batch_if_head; see _head_lease.
+        _validate_json_value(tenant)
+        _validate_json_value(event)
+        _validate_required_count(expected_count)
+        _validate_expected_hash(expected_hash)
+        with self._head_lease(tenant, expected_count, expected_hash) as f:
+            return self._append_if_head_locked(
+                f, tenant, event, expected_count, expected_hash
+            )
+
+    def append_batch_if_head(self, tenant, events,
+                             expected_count, expected_hash):
+        # Conditional batch append: append_batch's atomic group commit fused
+        # with append_if_head's optimistic head assertion. events must be a
+        # list (a bare JSON value, including a string, is not a batch); the
+        # tenant and every event cross the same standard-JSON boundary as
+        # append; expected_count must be a non-negative plain int (bool,
+        # negative, float and other types are ValueError) and expected_hash
+        # must be exactly the 64 lowercase hex characters of a sha256 digest
+        # (the empty-chain head is asserted with ZERO). Every input crosses
+        # its boundary before a lease is taken, a path is probed or a single
+        # byte is read, so a malformed call raises ValueError without
+        # creating or touching anything, under any contention. An empty list
+        # is a no-op after validation: nothing is created, no existing byte
+        # is touched and no assertion is evaluated.
+        if not isinstance(events, list):
+            raise ValueError(
+                f"events must be a list, got {type(events).__name__}"
+            )
+        _validate_json_value(tenant)
+        for event in events:
+            _validate_json_value(event)
+        _validate_required_count(expected_count)
+        _validate_expected_hash(expected_hash)
+        if not events:
+            return []
+        # One exclusive lease covers the scan of the tenant's full chain, the
+        # head comparison and the single block write, so the batch commits as
+        # one indivisible byte interval: competing writers and shared-lease
+        # readers only ever observe the state wholly before or wholly after
+        # it. A corrupt history raises AuditChainStateError (same
+        # tenant/seq/reason/line as append) and takes priority over the
+        # conflict check; a well-formed but mismatching head raises
+        # AuditChainConflictError with the actual tail; neither failure path
+        # writes a byte. On a not-yet-existing log only an exact (0, ZERO)
+        # assertion may create the file (see _head_lease). The returned
+        # records are numbered from expected_count + 1 with the first prev
+        # equal to expected_hash, and the committed bytes are identical to
+        # calling append for each event in order from the same head.
+        with self._head_lease(tenant, expected_count, expected_hash) as f:
+            return self._append_batch_if_head_locked(
+                f, tenant, events, expected_count, expected_hash
+            )
 
     def _verify_all_snapshot(self, data):
         # Core of verify_all over an exact in-memory snapshot. Touches no path:
