@@ -108,6 +108,26 @@ def _validate_expected_hash(expected_hash):
         )
 
 
+def _validate_range_bound(start_seq, end_seq):
+    # export_tenant_range's closed-interval boundary: start_seq is a positive
+    # plain int and end_seq is None or a positive plain int not smaller than
+    # start_seq. bool is rejected even though it subclasses int; floats,
+    # strings and other types are too. Checked before any history is read.
+    if isinstance(start_seq, bool) or not isinstance(start_seq, int) \
+            or start_seq < 1:
+        raise ValueError(
+            f"start_seq must be a positive integer, got {start_seq!r}"
+        )
+    if end_seq is not None and (
+        isinstance(end_seq, bool) or not isinstance(end_seq, int)
+        or end_seq < start_seq
+    ):
+        raise ValueError(
+            "end_seq must be None or an integer not smaller than "
+            f"start_seq ({start_seq}), got {end_seq!r}"
+        )
+
+
 class AuditChainStateError(Exception):
     def __init__(self, tenant, seq, reason=None, line=None):
         self.tenant = tenant
@@ -135,6 +155,24 @@ class AuditChainConflictError(Exception):
             f"audit chain head conflict for tenant {tenant!r}: "
             f"expected count={expected_count} hash={expected_hash}, "
             f"actual count={actual_count} hash={actual_hash}"
+        )
+
+
+class AuditChainRangeError(Exception):
+    # A syntactically valid range request whose closed interval does not lie
+    # wholly inside an existing, verified chain: the chain is empty, the
+    # start lies past the tail, or an explicit end runs past it. reason is
+    # fixed; count is the verified total number of records the tenant has, so
+    # a caller can retry with the real tail without re-reading the log.
+    def __init__(self, tenant, start_seq, end_seq, count):
+        self.tenant = tenant
+        self.start_seq = start_seq
+        self.end_seq = end_seq
+        self.count = count
+        self.reason = "range"
+        super().__init__(
+            f"audit chain range out of bounds for tenant {tenant!r}: "
+            f"requested [{start_seq}, {end_seq}] on a chain of {count}"
         )
 
 
@@ -330,6 +368,61 @@ class AuditChain:
             seq = item["seq"]
             # Same strict JSON-integer seq rule as _scan: a float spelling
             # (1.0, 1e0), bool, string, null, array/object or a mismatching
+            # integer is a sequence defect, never renumbered or skipped.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
+                raise _Broken("sequence", expected, line, expected)
+            if item["prev"] != prev:
+                raise _Broken("digest", expected, line, expected)
+            if item["hash"] != self._hash(item):
+                raise _Broken("digest", expected, line, expected)
+            records.append(item)
+            prev = item["hash"]
+            expected += 1
+        if bad_line is not None:
+            raise _Broken("missing", None, bad_line, expected)
+        return records
+
+    def _scan_import_range(self, tenant, lines, bad_line,
+                           expected_count, expected_hash):
+        # Validate a non-empty single-tenant segment that continues a chain
+        # whose omitted prefix is asserted by (expected_count, expected_hash):
+        # every physical line must carry exactly the five FIELDS keys and the
+        # exact same canonical JSON tenant identity, seqs must run
+        # expected_count+1 .. expected_count+n consecutively, the first prev
+        # must equal expected_hash (the omitted prefix's tail digest, ZERO for
+        # an empty prefix), each later prev must equal the previous record's
+        # hash and every digest must verify. Returns the parsed records in
+        # physical (== seq) order. Chain defects raise _Broken with the same
+        # reason/at/line/expect filling rules _scan_import uses, so the
+        # resulting AuditChainStateError is shaped exactly like append's; a
+        # record of another tenant identity violates the single-tenant input
+        # contract and raises _ForeignTenant (surfaced as ValueError by
+        # import_tenant_range), the first physical-line problem winning.
+        key = self._tenant_key(tenant)
+        records = []
+        expected = expected_count + 1
+        prev = expected_hash
+        for line, raw in enumerate(lines, 1):
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise _Broken("missing", None, line, expected)
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise _Broken("missing", None, line, expected)
+            if self._tenant_key(item["tenant"]) != key:
+                raise _ForeignTenant(line)
+            # A segment record must carry exactly the five existing fields;
+            # a missing or extra field is a missing-class defect, exactly the
+            # exact-fields rule import_all applies.
+            if set(item) != set(FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) and not isinstance(seq, bool) \
+                    else expected
+                raise _Broken("missing", at, line, expected)
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as _scan: a float spelling
+            # (1.0, 1e0), bool, string, null, array/object or a non-consecutive
             # integer is a sequence defect, never renumbered or skipped.
             if isinstance(seq, bool) or not isinstance(seq, int) \
                     or seq != expected:
@@ -1063,6 +1156,60 @@ class AuditChain:
                 )
         return b"".join(chunks)
 
+    def export_tenant_range(self, tenant, start_seq, end_seq=None):
+        # Offline segmented migration export for a non-empty chain: export the
+        # closed interval [start_seq, end_seq] (end_seq None means through the
+        # current tail) of one tenant's verified history so an archive or
+        # restore can continue from a known head. Returns UTF-8 JSONL bytes
+        # containing only the target tenant's records, with the original
+        # tenant/seq/event/prev/hash values verbatim -- nothing is renumbered
+        # or recomputed; the first exported record's prev is the (omitted)
+        # prefix's tail digest, so the segment is self-describing and can be
+        # grafted back with import_tenant_range. Like export_tenant this never
+        # creates, mutates or deletes any path and never touches the network.
+        #
+        # Every argument crosses its boundary before any history is read: the
+        # tenant uses the same standard-JSON rule as append/verify/export and
+        # start_seq/end_seq must be positive plain ints (bool rejected even
+        # though it subclasses int; floats and other types are too), end_seq
+        # None or not smaller than start_seq. An illegal call raises
+        # ValueError without a single byte being read or created.
+        _validate_json_value(tenant)
+        _validate_range_bound(start_seq, end_seq)
+        # One shared-lease consistent read: the exact scan verify(tenant)
+        # runs first clears the complete snapshot for this tenant, so a
+        # corrupt source raises AuditChainStateError (same tenant/seq/reason/
+        # line as export_tenant) instead of returning a prefix, and the
+        # interval slice is taken only after the full chain is verified.
+        data = self._read_snapshot()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            count, _head = self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # The interval must lie wholly inside the existing non-empty chain:
+        # an empty chain, a start past the tail, or an explicit end past the
+        # tail is AuditChainRangeError (reason fixed "range", carrying the
+        # verified count), not bytes and not a state error.
+        if count < start_seq or (end_seq is not None and count < end_seq):
+            raise AuditChainRangeError(tenant, start_seq, end_seq, count)
+        lo, hi = start_seq - 1, count if end_seq is None else end_seq
+        key = self._tenant_key(tenant)
+        chunks = []
+        index = 0
+        for raw in lines:
+            item = _strict_loads(raw)
+            if self._tenant_key(item["tenant"]) != key:
+                continue
+            if lo <= index < hi:
+                chunks.append(
+                    (json.dumps(item, sort_keys=True, allow_nan=False) + "\n")
+                    .encode("utf-8")
+                )
+            index += 1
+        return b"".join(chunks)
+
     def export_all(self):
         # Whole-log offline migration export: the multi-tenant counterpart
         # of export_tenant. Returns the log's raw UTF-8 bytes only: it never
@@ -1153,6 +1300,96 @@ class AuditChain:
             # imported record has prev ZERO, so it links directly into the
             # empty target chain regardless of the other tenants interleaved
             # on disk; seqs and hashes stay exactly the validated ones.
+            chunks = [
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                for item in records
+            ]
+            prefix = b"" if (not target or target.endswith(b"\n")) else b"\n"
+            f.write(prefix + "".join(chunks).encode("utf-8"))
+            return records
+
+    def import_tenant_range(self, tenant, data, expected_count, expected_hash):
+        # Offline segmented counterpart of export_tenant_range: continue a
+        # non-empty chain by grafting a single-tenant JSONL segment whose
+        # omitted prefix is asserted by (expected_count, expected_hash),
+        # without a network or remote anchor. Records keep their original
+        # tenant/seq/event/prev/hash values verbatim -- nothing is renumbered
+        # or recomputed -- so verify/verify_all/verify_bytes/export_tenant
+        # validate the merged log by the exact existing rules.
+        #
+        # Boundary first, exactly as every other entry point orders it: the
+        # tenant crosses the standard-JSON boundary, data must be bytes,
+        # expected_count must be a non-negative plain int (bool rejected even
+        # though it subclasses int) and expected_hash must be exactly 64
+        # lowercase hex characters (the empty-prefix head is ZERO). Every
+        # check runs before any lease is taken, history is read or the path is
+        # probed, so an illegal call raises ValueError regardless of target
+        # state or contention and creates nothing. Empty bytes are a no-op
+        # after that validation: no file is created, no history is read and no
+        # byte changes.
+        _validate_json_value(tenant)
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        _validate_required_count(expected_count)
+        _validate_expected_hash(expected_hash)
+        if not data:
+            return []
+        # The complete segment is verified in memory before the target is
+        # touched: strict UTF-8 JSONL, every physical line an object carrying
+        # exactly the five existing fields and this exact canonical tenant
+        # identity, seqs consecutive from expected_count + 1, the first prev
+        # equal to expected_hash (the omitted prefix's tail digest), each
+        # later prev equal to the previous record's hash and every digest
+        # recomputed. Parse failures, missing/extra fields, duplicate keys,
+        # non-standard numbers and illegal UTF-8 are missing, non-consecutive
+        # seqs are sequence and prev/hash mismatches are digest -- all raised
+        # as AuditChainStateError located by tenant, seq and the input's
+        # physical line number. A record of any other tenant identity
+        # violates the single-tenant input contract and raises ValueError.
+        # Every input-side error reaches the caller before a target-side
+        # check can.
+        lines, bad_line = self._decode_lines(data)
+        try:
+            records = self._scan_import_range(
+                tenant, lines, bad_line, expected_count, expected_hash
+            )
+        except _ForeignTenant as ft:
+            raise ValueError(
+                f"import data must contain only tenant {tenant!r}; "
+                f"a record of another tenant appears at line {ft.line}"
+            ) from None
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        # Target validation, the head comparison and the block write share one
+        # exclusive lease -- the same conditional lease append_if_head uses --
+        # so check-and-commit is one atomic operation: on a missing log only
+        # the exact (0, ZERO) assertion may create the file, any other
+        # assertion conflicts against the empty head and leaves no file;
+        # competing writers and shared-lease readers only ever observe the
+        # state wholly before or wholly after the graft.
+        with self._head_lease(tenant, expected_count, expected_hash) as f:
+            target = f.read()
+            t_lines, t_bad = self._decode_lines(target)
+            try:
+                count, head = self._scan(tenant, t_lines, t_bad)
+            except _Broken as b:
+                # A corrupt target is reported exactly as append reports it
+                # and takes strict priority over the head comparison: an
+                # unverifiable chain is never compared against the assertion.
+                seq = b.at if b.at is not None else b.expect
+                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+            if count != expected_count or head != expected_hash:
+                raise AuditChainConflictError(
+                    tenant, expected_count, expected_hash, count, head
+                )
+            # Head confirmed. One O_APPEND write commits the whole segment as
+            # a single block, re-serialized with the exact rule
+            # append/export use; the records' seqs and hashes stay exactly the
+            # validated ones and the first record's prev links the block to
+            # the asserted (omitted) prefix tail. A concurrent contender that
+            # reaches the lease after a winning commit observes the winner's
+            # new tail and conflicts with that actual head.
             chunks = [
                 json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
                 for item in records
