@@ -663,6 +663,201 @@ class AuditChain:
             f.write(prefix + "".join(chunks).encode("utf-8"))
             return items
 
+    @contextlib.contextmanager
+    def _many_heads_lease(self, norm):
+        # Exclusive lease for one conditional multi-tenant append: validation
+        # snapshot, every head comparison and the single block write must be
+        # indivisible relative to all other writers. On an existing log that is
+        # the ordinary data-file lease -- a fresh "r+b" open fails instead of
+        # creating the path, so a losing call leaves no file. Before the log
+        # exists, the data-file lock cannot be taken without creating it (and a
+        # losing assertion must leave no trace), so the directory lease -- the
+        # same one ordinary appends hold while creating the file -- guards the
+        # whole missing-file branch; the existence probe, the empty-chain
+        # comparisons and a winning creation are therefore indivisible relative
+        # to every other writer. The file is created ("a+b") only when every
+        # assertion is an exact (0, ZERO) empty-chain assertion; otherwise the
+        # first mismatching entry in input order is a deterministic conflict
+        # against the (0, ZERO) actual head and is raised before any open that
+        # could create the path. Lock order is always directory-then-data,
+        # never deadlocking against a plain append. _dir_lease also makes the
+        # parent directory.
+        with self._dir_lease():
+            try:
+                f = open(self.path, "r+b")
+            except FileNotFoundError:
+                # Definitive empty chain for every tenant: no other writer can
+                # create the path while this lease is held.
+                mismatch = next(
+                    ((t, ec, eh) for t, _e, ec, eh in norm
+                     if ec != 0 or eh != ZERO),
+                    None,
+                )
+                if mismatch is not None:
+                    tenant, expected_count, expected_hash = mismatch
+                    raise AuditChainConflictError(
+                        tenant, expected_count, expected_hash, 0, ZERO
+                    )
+                f = open(self.path, "a+b")
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                yield f
+            finally:
+                f.flush()
+                f.close()
+
+    def _append_many_if_heads_locked(self, f, norm):
+        # Scan, compare and append on a description already holding the
+        # exclusive data-file lease. norm is the fully validated entry list as
+        # tuples (tenant, events(list, non-empty), expected_count,
+        # expected_hash), canonical-tenant unique, in input order.
+        data = f.read()
+        lines, bad_line = self._decode_lines(data)
+        # Each involved tenant gets the exact full-chain scan append runs
+        # (seqs 1..n from a ZERO prev, each digest recomputed); foreign
+        # records interleave freely. A defect is recorded, not raised
+        # immediately: when several involved chains are broken, the first
+        # physical line in the log decides the result, an equal line is broken
+        # by the entry's first-appearance input index -- exactly the rule
+        # append_many follows -- and damage to a tenant no entry involves is
+        # ignored. The state is never asserted against an unverifiable chain.
+        heads = {}   # serialized tenant -> [count, prev]
+        broken = []  # (line, first_input_index, AuditChainStateError)
+        for idx, (tenant, _events, _ec, _eh) in enumerate(norm):
+            key = self._tenant_key(tenant)
+            # norm is validated unique per canonical tenant identity, so each
+            # key is scanned once; idx is its first (only) input position.
+            try:
+                count, prev = self._scan(tenant, lines, bad_line)
+            except _Broken as b:
+                seq = b.at if b.at is not None else b.expect
+                broken.append((
+                    b.line, idx,
+                    AuditChainStateError(tenant, seq, b.reason, b.line),
+                ))
+            else:
+                heads[key] = [count, prev]
+        if broken:
+            raise min(broken, key=lambda x: (x[0], x[1]))[2] from None
+        # Every involved pre-state is valid. Compare every assertion in entry
+        # order; the first mismatching one, regardless of tenant, raises with
+        # that entry's expectation and the chain tail observed inside the
+        # lease. State errors above take strict priority; a conflict writes no
+        # byte.
+        for tenant, _events, expected_count, expected_hash in norm:
+            count, head = heads[self._tenant_key(tenant)]
+            if count != expected_count or head != expected_hash:
+                raise AuditChainConflictError(
+                    tenant, expected_count, expected_hash, count, head
+                )
+        # All heads confirmed. Emit the records entry by entry, event by event:
+        # each tenant is numbered continuously from its asserted tail, with
+        # the first record's prev equal to the asserted hash and each later
+        # record linking to the previous record of that tenant (on disk, or
+        # earlier in this block). The physical JSONL order is the entry/event
+        # input order. Fields, hashing, canonical serialization
+        # (sort_keys=True, allow_nan=False) and the missing-newline prefix are
+        # byte-for-byte the rules append/append_many follow.
+        items = []
+        chunks = []
+        progress = {key: [count, prev] for key, (count, prev) in heads.items()}
+        for tenant, events, _ec, _eh in norm:
+            key = self._tenant_key(tenant)
+            count, prev = progress[key]
+            for event in events:
+                item = {"tenant": tenant, "seq": count + 1,
+                        "event": event, "prev": prev}
+                item["hash"] = self._hash(item)
+                items.append(item)
+                chunks.append(
+                    json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                )
+                count += 1
+                prev = item["hash"]
+            progress[key] = [count, prev]
+        # One O_APPEND write places the whole group atomically at the current
+        # end of file; under the exclusive lease no other writer moves that
+        # end, and no existing byte can be overwritten.
+        prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+        f.write(prefix + "".join(chunks).encode("utf-8"))
+        return items
+
+    def append_many_if_heads(self, entries):
+        # Cross-tenant conditional atomic append: append_many's indivisible
+        # multi-tenant group commit fused with one head assertion per tenant,
+        # generalizing append_batch_if_head to several chains at once. entries
+        # must be a list; every member must be an object whose key set is
+        # exactly {"tenant", "events", "expected_count", "expected_hash"}.
+        # events must be a non-empty list, expected_count a non-negative plain
+        # int (bool rejected even though it subclasses int), expected_hash
+        # exactly 64 lowercase hex characters (the empty-chain head is ZERO);
+        # a canonical JSON tenant identity may appear at most once. The tenant
+        # and every event cross the same standard-JSON boundary as append.
+        # All of that is checked before a lease is taken, a path is probed or a
+        # single byte is read, so a malformed call raises ValueError without
+        # creating or touching anything, under any contention. An empty list
+        # is a no-op after validation: no file is created, no history is read
+        # and no byte changes.
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"entries must be a list, got {type(entries).__name__}"
+            )
+        norm = []
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {
+                "tenant", "events", "expected_count", "expected_hash"
+            }:
+                raise ValueError(
+                    "each entry must be an object containing exactly the keys "
+                    "'tenant', 'events', 'expected_count' and "
+                    f"'expected_hash', got {entry!r}"
+                )
+            tenant = entry["tenant"]
+            events = entry["events"]
+            expected_count = entry["expected_count"]
+            expected_hash = entry["expected_hash"]
+            if not isinstance(events, list) or not events:
+                raise ValueError(
+                    "events must be a non-empty list, got "
+                    f"{events!r}"
+                )
+            _validate_json_value(tenant)
+            for event in events:
+                _validate_json_value(event)
+            _validate_required_count(expected_count)
+            _validate_expected_hash(expected_hash)
+            key = self._tenant_key(tenant)
+            if key in seen:
+                raise ValueError(
+                    f"duplicate tenant entry (same canonical JSON identity): "
+                    f"{tenant!r}"
+                )
+            seen.add(key)
+            norm.append((tenant, events, expected_count, expected_hash))
+        if not norm:
+            return []
+        # One exclusive lease covers every involved chain's full scan, all
+        # head comparisons and the single block write, so the group commits as
+        # one indivisible byte interval: competing writers and shared-lease
+        # readers only ever observe the state wholly before or wholly after
+        # it. A not-yet-existing log may be created only when every assertion
+        # is the exact empty-chain head (0, ZERO); any other assertion is a
+        # deterministic conflict (actual (0, ZERO)) that leaves no file -- the
+        # lease derives that rule from norm before opening the path. A corrupt
+        # involved chain raises AuditChainStateError (same
+        # tenant/seq/reason/line as append, first physical line then input
+        # order deciding across chains) and takes priority over the conflict
+        # checks; a well-formed but mismatching head raises
+        # AuditChainConflictError at the first mismatching entry in entries
+        # order, with the actual tail; neither failure path writes a byte.
+        # Concurrent commits on overlapping heads therefore have at most one
+        # winner; every loser observes the winner's new tail inside the lease
+        # and conflicts with that actual head.
+        with self._many_heads_lease(norm) as f:
+            return self._append_many_if_heads_locked(f, norm)
+
     def _verify_all_snapshot(self, data, with_hash=False):
         # Core of verify_all over an exact in-memory snapshot. Touches no path:
         # the caller owns how the bytes were obtained (a shared-lease file read
