@@ -1310,6 +1310,64 @@ class AuditChain:
         self._scan_all_chains(lines, bad_line)
         return data
 
+    def export_tenant_chunks(self, tenant, chunk_size):
+        # Chunked counterpart of export_tenant for large histories: the same
+        # offline single-tenant migration export, delivered as an iterator of
+        # consecutive bytes chunks of at most chunk_size bytes each, so the
+        # caller can stream the result without holding one contiguous buffer.
+        # Concatenating the chunks in order yields exactly the bytes
+        # export_tenant(tenant) returns; a chunk boundary may fall at any
+        # byte position -- mid-UTF-8-sequence, mid-line or mid-record -- and
+        # only the concatenation is ever decoded.
+        #
+        # Boundary first, exactly as export_tenant orders it: the tenant
+        # crosses the same standard-JSON boundary as append/verify/export,
+        # and chunk_size must be a positive plain int (bool is rejected even
+        # though it subclasses int; zero, negatives, floats and other types
+        # are too). Both are checked before a single byte is read, so an
+        # illegal call raises ValueError without reading or creating
+        # anything, under any contention.
+        _validate_json_value(tenant)
+        self._validate_chunk_size(chunk_size)
+        # The whole export is completed eagerly, before the first chunk
+        # exists: one shared-lease snapshot pins the result to a state wholly
+        # before or after some append, and the exact full-chain scan
+        # export_tenant runs must clear that complete snapshot first. A
+        # corrupt source therefore raises AuditChainStateError (same
+        # tenant/seq/reason/line as export_tenant) from this call itself and
+        # no chunk iterator -- let alone a partial export -- is ever
+        # produced. A missing tenant or empty log is a legitimate empty
+        # export and yields an empty iterator. Appends after this call cannot
+        # alter the chunks: they are cut from the already-fixed snapshot.
+        return self._chunk_slices(self.export_tenant(tenant), chunk_size)
+
+    def export_all_chunks(self, chunk_size):
+        # Chunked counterpart of export_all for large histories: the same
+        # whole-log offline migration export, delivered as an iterator of
+        # consecutive bytes chunks of at most chunk_size bytes each.
+        # Concatenating the chunks in order yields exactly the bytes
+        # export_all() returns -- the verified snapshot verbatim, interleaved
+        # tenant order included; a chunk boundary may fall at any byte
+        # position and only the concatenation is ever decoded.
+        #
+        # chunk_size must be a positive plain int (bool is rejected even
+        # though it subclasses int; zero, negatives, floats and other types
+        # are too), checked before a single byte is read, so an illegal call
+        # raises ValueError without reading or creating anything, under any
+        # contention.
+        self._validate_chunk_size(chunk_size)
+        # The whole export is completed eagerly, before the first chunk
+        # exists: one shared-lease snapshot pins the result to a state wholly
+        # before or after some append, and every tenant chain in it is
+        # validated with the exact rules export_all applies first. A corrupt
+        # log therefore raises AuditChainStateError (same
+        # tenant/seq/reason/line as export_all) from this call itself and no
+        # partial export is ever produced. A missing or empty log is a
+        # legitimate empty export and yields an empty iterator. Appends after
+        # this call cannot alter the chunks: they are cut from the
+        # already-fixed snapshot.
+        return self._chunk_slices(self.export_all(), chunk_size)
+
     def import_tenant(self, tenant, data):
         # Offline counterpart of export_tenant: graft a single-tenant export
         # (or any strictly valid single-tenant JSONL history) onto this log
@@ -1714,6 +1772,74 @@ class AuditChain:
             f.write(prefix + "".join(chunks).encode("utf-8"))
             return records
 
+    def import_tenant_chunks(self, tenant, chunks):
+        # Chunked counterpart of import_tenant for large histories: the
+        # caller hands the single-tenant export over as an iterable of bytes
+        # chunks in file order instead of one contiguous buffer. Chunks may
+        # be cut at any byte boundary (mid-UTF-8-sequence, mid-line,
+        # mid-record) and empty chunks are allowed; only their concatenation
+        # is the import content, and anything import_tenant accepts is
+        # accepted here.
+        #
+        # Boundary first, in the exact order import_tenant uses: the tenant
+        # crosses the same standard-JSON boundary as append/verify/export,
+        # then the chunk container must be an iterable of bytes (a bare bytes
+        # or bytearray object, a non-iterable container or a non-bytes
+        # element are all ValueError, a bad element ending consumption at
+        # once). Both are checked before any lease is taken, any history is
+        # read or the path is probed, so an illegal call raises ValueError
+        # regardless of target state or contention and creates nothing. An
+        # empty concatenation is a no-op after that validation: no file is
+        # created, no history is read and no byte changes.
+        _validate_json_value(tenant)
+        # From here on the call is exactly import_tenant over the joined
+        # bytes: the complete input chain is verified in memory before the
+        # target is ever touched (chain defects raise AuditChainStateError
+        # with the same tenant/seq/reason/line, a foreign tenant record is a
+        # ValueError, input problems taking priority over every target-side
+        # state), the target scan and the emptiness check share one exclusive
+        # lease with the single block write (a corrupt target is
+        # AuditChainStateError, an already-occupied target chain is
+        # AuditChainConflictError, neither failure path writing a byte), and
+        # the whole content commits as one indivisible byte interval that
+        # concurrent readers only ever observe wholly before or wholly after.
+        # The returned records are the same record objects import_tenant
+        # returns, in physical (== seq) order.
+        return self.import_tenant(tenant, self._join_chunks(chunks))
+
+    def import_all_chunks(self, chunks):
+        # Chunked counterpart of import_all for large histories: the caller
+        # hands the multi-tenant interleaved snapshot over as an iterable of
+        # bytes chunks in file order instead of one contiguous buffer. Chunks
+        # may be cut at any byte boundary and empty chunks are allowed; only
+        # their concatenation is the import content, and anything import_all
+        # accepts is accepted here.
+        #
+        # Boundary first, exactly as import_all orders it: the chunk
+        # container must be an iterable of bytes (a bare bytes or bytearray
+        # object, a non-iterable container or a non-bytes element are all
+        # ValueError, a bad element ending consumption at once), checked
+        # before any lease is taken, any history is read or the path is
+        # probed, so an illegal call raises ValueError regardless of target
+        # state or contention and creates nothing. An empty concatenation is
+        # a no-op after that check: no file is created, no history is read
+        # and no byte changes.
+        #
+        # From here on the call is exactly import_all over the joined bytes:
+        # the complete input is verified in memory before the target is ever
+        # touched (defects raise AuditChainStateError with the same
+        # tenant/seq/reason/line, input problems taking priority over every
+        # target-side state), the involved target chains are scanned and the
+        # emptiness checks evaluated inside one exclusive lease shared with
+        # the single block write (a corrupt involved chain is
+        # AuditChainStateError, an already-occupied involved chain is
+        # AuditChainConflictError, neither failure path writing a byte), and
+        # the whole snapshot commits as one indivisible byte interval that
+        # concurrent readers only ever observe wholly before or wholly after.
+        # The returned records are the same record objects import_all
+        # returns, in the input's physical order.
+        return self.import_all(self._join_chunks(chunks))
+
     def read_tenant(self, tenant, start_seq=1, page_size=None):
         # Read-only, single-tenant paged view. Returns plain record dicts
         # (each carrying exactly the tenant/seq/event/prev/hash fields with
@@ -1872,6 +1998,34 @@ class AuditChain:
         if not isinstance(data, bytes):
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
         return self._verify_all_snapshot(data)
+
+    @staticmethod
+    def _validate_chunk_size(chunk_size):
+        # chunk_size is the mandatory maximum chunk length of a chunked
+        # export: a positive plain int. bool is rejected even though it
+        # subclasses int; zero, negatives, floats, strings and other types
+        # are too, so the slicing below always steps by an unambiguous
+        # positive integer.
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) \
+                or chunk_size < 1:
+            raise ValueError(
+                f"chunk_size must be a positive integer, got {chunk_size!r}"
+            )
+
+    @staticmethod
+    def _chunk_slices(data, chunk_size):
+        # Lazily slice an already-complete byte export into consecutive
+        # chunks of at most chunk_size bytes, in file order. The export
+        # itself (snapshot read and full-chain validation) has already
+        # finished before this iterator exists, so consuming it can never
+        # surface a state error or a partial result; empty data yields an
+        # empty iterator. Chunk boundaries fall wherever the size lands --
+        # mid-UTF-8-sequence, mid-line or mid-record -- since only the
+        # concatenation is ever decoded.
+        return (
+            data[i:i + chunk_size]
+            for i in range(0, len(data), chunk_size)
+        )
 
     @staticmethod
     def _join_chunks(chunks):
