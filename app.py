@@ -2048,6 +2048,32 @@ class AuditChain:
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
         return self._verify_all_snapshot(data)
 
+    def heads_bytes(self, data):
+        # Pure in-memory, offline chain-head directory: the counterpart of
+        # heads() over a caller-supplied snapshot, fusing verify_all_bytes's
+        # validation pass with each tenant's verified tail digest, so an
+        # offline caller can prepare conditional appends from a snapshot it
+        # already holds in memory. The result is exactly what heads() would
+        # return for identical file contents -- {"ok": True, "tenants": [...]}
+        # in tenant first-appearance physical order, each entry echoing the
+        # original tenant value verbatim plus its verified count and tail
+        # hash (the exact expected_count/expected_hash pair an offline
+        # conditional append asserts), {"ok": True, "tenants": []} for empty
+        # bytes -- and a failure carries verify_all_bytes's exact fields
+        # ({"ok": False, "at": line, "tenant": ..., "reason": ...}), with no
+        # partial tenant list. Strict UTF-8, LF-bounded physical lines,
+        # standard JSON (duplicate keys and non-standard numbers rejected),
+        # canonical JSON tenant identity, seq starting at 1 from a ZERO prev
+        # and every digest recomputed: all the rules _verify_all_snapshot
+        # applies. Like verify_all_bytes this consumes only the given buffer:
+        # it never reads, creates or modifies the configured path, never
+        # touches the network, keeps no cache and never mutates data. data
+        # must be exactly bytes -- bytearray, str and every other type are
+        # ValueError, raised before any parsing.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        return self._verify_all_snapshot(data, with_hash=True)
+
     @staticmethod
     def _join_chunks(chunks):
         # Validate and concatenate a chunked byte history. chunks must be an
@@ -2129,3 +2155,27 @@ class AuditChain:
         # container or a non-bytes element are all ValueError, a bad element
         # ending consumption at once.
         return self._verify_all_snapshot(self._join_chunks(chunks))
+
+    def heads_chunks(self, chunks):
+        # Chunked offline chain-head directory: the counterpart of heads() /
+        # heads_bytes() for a caller-supplied snapshot streamed as an ordered
+        # iterable of bytes chunks instead of one contiguous buffer. Chunks
+        # may be cut at any byte boundary -- mid-UTF-8-sequence, mid-line or
+        # mid-record -- and empty chunks are allowed; only their in-order
+        # concatenation is the snapshot, so field-for-field the result is
+        # exactly what heads_bytes returns for the concatenated bytes
+        # (ok/tenants on success, ok/at/tenant/reason on failure), including
+        # tenant first-appearance physical order, each tenant's verified
+        # count and tail hash -- the expected_count/expected_hash an offline
+        # conditional append needs -- and the empty-history
+        # {"ok": True, "tenants": []} for an empty iterable or one made only
+        # of empty chunks. The same _join_chunks boundary every other chunk
+        # entry uses applies: a bare bytes or bytearray object is not a chunk
+        # container, a non-iterable container or the first non-bytes element
+        # (a bytearray element included) are ValueError and consumption stops
+        # at that element at once. Like heads_bytes this consumes only caller
+        # data: it never reads, creates or modifies the configured path,
+        # never touches the network, keeps no cache and never mutates a
+        # chunk.
+        return self._verify_all_snapshot(
+            self._join_chunks(chunks), with_hash=True)
