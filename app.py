@@ -238,25 +238,51 @@ class AuditChain:
             f.close()
 
     @staticmethod
-    def _decode_lines(data):
-        # Split the raw JSONL bytes into physical lines while treating the
-        # first illegal UTF-8 byte as a hard, locatable stop point.
-        # Returns (lines, bad_line): lines are the complete physical lines
-        # preceding any corruption (all lines when the file is valid UTF-8),
-        # bad_line is the 1-based line number of the first undecodable line
-        # or None. A bad line is never yielded, even if the bytes before the
-        # illegal byte looked like complete JSON: callers scan the preceding
-        # complete lines first, so an earlier JSON/sequence/digest error
-        # still takes priority.
+    def _split_lf(text):
+        # Physical lines are bounded by exactly one character: the byte 0x0A
+        # (LF), so a CRLF sequence is still one line -- the trailing CR stays
+        # attached to its line and strict JSON accepts it as line-ending
+        # whitespace. No other character ends a record: U+0085, U+2028,
+        # U+2029 and a bare CR are valid UTF-8 content of the current line
+        # and are handed to strict JSON (which keeps the three Unicode
+        # separators as ordinary string content and rejects a raw CR inside
+        # a JSON string). str.splitlines() must never be used here: it treats
+        # all of those as line boundaries. The input is non-empty and, for a
+        # trailing-LF text, the single empty segment after the final LF is
+        # dropped (matching a physical record count: every LF terminates one
+        # line, it does not begin an extra empty one).
+        lines = text.split("\n")
+        if text.endswith("\n"):
+            lines.pop()
+        return lines
+
+    @classmethod
+    def _decode_lines(cls, data):
+        # Split the raw JSONL bytes into LF-bounded physical lines while
+        # treating the first illegal UTF-8 byte as a hard, locatable stop
+        # point. Returns (lines, bad_line): lines are the complete physical
+        # lines preceding any corruption (all lines when the bytes are valid
+        # UTF-8), bad_line is the 1-based LF physical line number of the
+        # first undecodable line or None. A bad line is never yielded, even
+        # if the bytes before the illegal byte looked like complete JSON:
+        # callers scan the preceding complete lines first, so an earlier
+        # JSON/sequence/digest error still takes priority. Empty bytes are
+        # zero physical lines, not one blank one.
+        if not data:
+            return [], None
         try:
-            return data.decode("utf-8").splitlines(), None
+            return cls._split_lf(data.decode("utf-8")), None
         except UnicodeDecodeError as exc:
             # start is the offset of the first byte that cannot be decoded;
-            # everything before it is a valid UTF-8 prefix.
+            # everything before it is a valid UTF-8 prefix. Physical lines
+            # count LF bytes only, so the bad line's number is one plus the
+            # number of LFs before that offset.
             start = exc.start
-        bad_line = data.count(b"\n", 0, start) + 1
-        cut = data.rfind(b"\n", 0, start) + 1  # start of the bad line
-        return data[:cut].decode("utf-8").splitlines(), bad_line
+            bad_line = data.count(b"\n", 0, start) + 1
+            cut = data.rfind(b"\n", 0, start) + 1  # start of the bad line
+            prefix = data[:cut]
+            lines = cls._split_lf(prefix.decode("utf-8")) if prefix else []
+            return lines, bad_line
 
     @staticmethod
     def _tenant_key(tenant):
