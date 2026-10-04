@@ -476,6 +476,86 @@ class AuditChain:
             raise AuditChainStateError(None, None, "missing", bad_line) from None
         return records
 
+    def _scan_import_ranges(self, lines, bad_line, assertions):
+        # Validate a multi-tenant segmented import byte stream before the
+        # target is touched. assertions is the fully validated list of
+        # (tenant, expected_count, expected_hash) tuples in expected_heads
+        # order; each asserted tenant must appear in the stream at least
+        # once. Tenants may interleave freely, but every physical line must be
+        # an object carrying exactly the five FIELDS keys of a tenant named in
+        # assertions; a record of an unlisted canonical tenant identity
+        # violates the segmented input contract and raises _ForeignTenant
+        # (surfaced as ValueError by import_all_range), exactly the rule
+        # _scan_import applies. Each tenant's seqs run expected_count+1,
+        # expected_count+2, ... continuously and the first prev equals the
+        # asserted hash, each digest recomputed. Returns the parsed records in
+        # physical order. The first defective physical line raises
+        # AuditChainStateError directly, filled exactly the way
+        # _scan_all_chains fills it; a line whose tenant cannot be determined
+        # (unparseable, non-object, no "tenant" key) reports tenant/seq None.
+        # After every line has validated, a listed tenant with no record is
+        # still a defect: the first such assertion in assertions order is
+        # reported as missing with line None. If bad_line is given, an
+        # undecodable physical line follows the lines provided and is
+        # reported as missing only when no earlier problem was found.
+        states = {}  # serialized tenant -> [tenant, expected, prev, seen]
+        for tenant, count, head in assertions:
+            states[self._tenant_key(tenant)] = [
+                tenant, count + 1, head, False]
+        records = []
+        for line, raw in enumerate(lines, 1):
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise AuditChainStateError(None, None, "missing", line) from None
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise AuditChainStateError(None, None, "missing", line) from None
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            state = states.get(key)
+            if state is None:
+                # A canonical tenant identity no head assertion lists: this
+                # violates the segmented input contract (surfaced as
+                # ValueError by import_all_range), the same rule
+                # _scan_import applies to a foreign single-tenant record. It
+                # is raised in physical-line order, so an earlier chain
+                # defect on a prior line still takes priority.
+                raise _ForeignTenant(line)
+            expected, prev = state[1], state[2]
+            if set(item) != set(FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) \
+                    and not isinstance(seq, bool) else expected
+                raise AuditChainStateError(tenant, at, "missing", line) from None
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as every other scan: 1.0/1e0,
+            # bools, strings, null, arrays/objects and mismatching integers are
+            # all sequence defects.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
+                raise AuditChainStateError(
+                    tenant, expected, "sequence", line) from None
+            if item["prev"] != prev:
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            if item["hash"] != self._hash(item):
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            state[1] += 1
+            state[2] = item["hash"]
+            state[3] = True
+            records.append(item)
+        if bad_line is not None:
+            # First undecodable byte: tenant cannot be parsed, so None.
+            raise AuditChainStateError(None, None, "missing", bad_line) from None
+        # Every listed tenant must have at least one record in the stream.
+        for tenant, count, _head in assertions:
+            state = states[self._tenant_key(tenant)]
+            if not state[3]:
+                raise AuditChainStateError(
+                    tenant, count + 1, "missing", None) from None
+        return records
+
     def append(self, tenant, event):
         # Validate the new input against the standard-JSON boundary before
         # anything else: an illegal tenant/event raises ValueError without
@@ -808,16 +888,20 @@ class AuditChain:
             return items
 
     @contextlib.contextmanager
-    def _many_heads_lease(self, norm):
-        # Exclusive lease for one conditional multi-tenant append: validation
-        # snapshot, every head comparison and the single block write must be
-        # indivisible relative to all other writers. On an existing log that is
-        # the ordinary data-file lease -- a fresh "r+b" open fails instead of
-        # creating the path, so a losing call leaves no file. Before the log
-        # exists, the data-file lock cannot be taken without creating it (and a
-        # losing assertion must leave no trace), so the directory lease -- the
-        # same one ordinary appends hold while creating the file -- guards the
-        # whole missing-file branch; the existence probe, the empty-chain
+    def _heads_lease(self, norm):
+        # Exclusive lease for one conditional multi-tenant commit shared by
+        # append_many_if_heads and import_all_range: validation snapshot, every
+        # head comparison and the single block write must be indivisible
+        # relative to all other writers. norm carries the asserted heads as
+        # (tenant, expected_count, expected_hash) tuples (plus an entry's
+        # events for append_many_if_heads); the lease itself only reads the
+        # count and hash. On an existing log that is the ordinary data-file
+        # lease -- a fresh "r+b" open fails instead of creating the path, so a
+        # losing call leaves no file. Before the log exists, the data-file
+        # lock cannot be taken without creating it (and a losing assertion
+        # must leave no trace), so the directory lease -- the same one
+        # ordinary appends hold while creating the file -- guards the whole
+        # missing-file branch; the existence probe, the empty-chain
         # comparisons and a winning creation are therefore indivisible relative
         # to every other writer. The file is created ("a+b") only when every
         # assertion is an exact (0, ZERO) empty-chain assertion; otherwise the
@@ -999,7 +1083,7 @@ class AuditChain:
         # Concurrent commits on overlapping heads therefore have at most one
         # winner; every loser observes the winner's new tail inside the lease
         # and conflicts with that actual head.
-        with self._many_heads_lease(norm) as f:
+        with self._heads_lease(norm) as f:
             return self._append_many_if_heads_locked(f, norm)
 
     def _verify_all_snapshot(self, data, with_hash=False):
@@ -1471,6 +1555,157 @@ class AuditChain:
             # regardless of the other tenants interleaved on disk. The file
             # is created by the lease only on this winning path: a missing
             # target cannot fail any check above.
+            chunks = [
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+                for item in records
+            ]
+            prefix = b"" if (not target or target.endswith(b"\n")) else b"\n"
+            f.write(prefix + "".join(chunks).encode("utf-8"))
+            return records
+
+    def import_all_range(self, data, expected_heads):
+        # Multi-tenant segmented offline migration: the cross-tenant
+        # counterpart of import_tenant_range. Several tenants' JSONL segments
+        # (typically produced by export_tenant_range calls against a source
+        # log) may interleave in one byte stream and are grafted onto this
+        # log as one indivisible block, each tenant continuing from its own
+        # known chain head named in expected_heads, without a network or
+        # remote anchor. Records keep their original
+        # tenant/seq/event/prev/hash values verbatim -- nothing is renumbered
+        # or recomputed -- so verify/verify_all/verify_bytes/export_* validate
+        # the merged log by the exact existing rules.
+        #
+        # Boundary first, exactly as every other entry point orders it: data
+        # must be bytes and expected_heads must be a list whose members are
+        # objects carrying exactly the keys tenant, expected_count and
+        # expected_hash; the tenant crosses the standard-JSON boundary,
+        # expected_count must be a non-negative plain int (bool rejected even
+        # though it subclasses int; floats, strings and other types are too)
+        # and expected_hash must be exactly the 64 lowercase hex characters
+        # of a sha256 digest (an empty target chain is asserted with ZERO); a
+        # canonical JSON tenant identity may appear at most once. All of that
+        # is checked before any lease is taken, any history is read or the
+        # path is probed, so an illegal call raises ValueError regardless of
+        # target state or contention and creates nothing. Empty bytes are a
+        # no-op after that validation: no file is created, no history is read
+        # and no byte changes; the assertions themselves are not evaluated.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        if not isinstance(expected_heads, list):
+            raise ValueError(
+                "expected_heads must be a list, got "
+                f"{type(expected_heads).__name__}"
+            )
+        assertions = []
+        seen = set()
+        for head in expected_heads:
+            if not isinstance(head, dict) or set(head) != {
+                "tenant", "expected_count", "expected_hash"
+            }:
+                raise ValueError(
+                    "each expected head must be an object containing exactly "
+                    "the keys 'tenant', 'expected_count' and "
+                    f"'expected_hash', got {head!r}"
+                )
+            tenant = head["tenant"]
+            expected_count = head["expected_count"]
+            expected_hash = head["expected_hash"]
+            _validate_json_value(tenant)
+            _validate_required_count(expected_count)
+            _validate_expected_hash(expected_hash)
+            key = self._tenant_key(tenant)
+            if key in seen:
+                raise ValueError(
+                    "duplicate tenant head assertion (same canonical JSON "
+                    f"identity): {tenant!r}"
+                )
+            seen.add(key)
+            assertions.append((tenant, expected_count, expected_hash))
+        if not data:
+            return []
+        # The complete input is verified in memory, before the target is ever
+        # touched: strict UTF-8 JSONL, every physical line an object carrying
+        # exactly the five existing fields of a listed tenant, each asserted
+        # tenant present at least once (tenants may interleave), seqs running
+        # expected_count+1, expected_count+2, ... from a first prev equal to
+        # the asserted hash and every digest recomputed. Parse failures,
+        # missing/extra fields, duplicate keys, non-standard numbers, blank
+        # lines, non-objects, illegal UTF-8 or a listed tenant without
+        # records are missing; sequence defects are sequence; prev/hash
+        # mismatches are digest -- all raised as AuditChainStateError located
+        # by tenant, seq and the input's physical line number (tenant/seq
+        # None when they cannot be determined), the first defective physical
+        # line deciding; input problems take priority over every target-side
+        # state. A record of a canonical tenant identity no assertion lists
+        # violates the input contract and is a ValueError, also decided by
+        # first physical line against the chain defects above. Nothing is
+        # read from the target and nothing is written on any input failure.
+        lines, bad_line = self._decode_lines(data)
+        try:
+            records = self._scan_import_ranges(lines, bad_line, assertions)
+        except _ForeignTenant as ft:
+            raise ValueError(
+                "import data must contain only tenants named by "
+                f"expected_heads; a record of another tenant appears at "
+                f"line {ft.line}"
+            ) from None
+        # Target scan, the head comparisons and the append share one
+        # exclusive lease (the same one append_many_if_heads uses: the
+        # data-file lease on an existing log, the directory lease guarding
+        # the missing-file branch), so check-and-commit is a single atomic
+        # operation. A not-yet-existing log may be created only when every
+        # assertion is the exact empty-chain head (0, ZERO); any other
+        # assertion is a deterministic conflict against the (0, ZERO) actual
+        # head that leaves no file -- the lease derives that rule from
+        # assertions before opening the path.
+        norm = [
+            (tenant, None, expected_count, expected_hash)
+            for tenant, expected_count, expected_hash in assertions
+        ]
+        with self._heads_lease(norm) as f:
+            # Only the chains this input involves are scanned. A corrupt
+            # involved chain raises AuditChainStateError (same
+            # tenant/seq/reason/line as append, first physical line then
+            # expected_heads order deciding across chains) and takes strict
+            # priority over the head comparisons; damage to an uninvolved
+            # tenant is ignored. The state is never compared against an
+            # unverifiable chain.
+            target = f.read()
+            t_lines, t_bad = self._decode_lines(target)
+            heads = {}   # serialized tenant -> (count, head)
+            broken = []  # (line, assertion_index, AuditChainStateError)
+            for idx, (tenant, _ec, _eh) in enumerate(assertions):
+                try:
+                    count, head = self._scan(tenant, t_lines, t_bad)
+                except _Broken as b:
+                    seq = b.at if b.at is not None else b.expect
+                    broken.append((
+                        b.line, idx,
+                        AuditChainStateError(tenant, seq, b.reason, b.line),
+                    ))
+                else:
+                    heads[self._tenant_key(tenant)] = (count, head)
+            if broken:
+                raise min(broken, key=lambda x: (x[0], x[1]))[2] from None
+            # Every involved chain is valid. Compare the assertions in
+            # expected_heads order; the first mismatching one raises with its
+            # expectation and the chain tail observed inside the lease. A
+            # conflict writes no byte.
+            for tenant, expected_count, expected_hash in assertions:
+                count, head = heads[self._tenant_key(tenant)]
+                if count != expected_count or head != expected_hash:
+                    raise AuditChainConflictError(
+                        tenant, expected_count, expected_hash, count, head
+                    )
+            # All heads confirmed: each segment's first prev names exactly
+            # the matching target tail, so the graft links seamlessly. One
+            # O_APPEND write commits the whole stream as a single block,
+            # re-serialized verbatim with the exact canonical rule
+            # append/export use (sort_keys=True, allow_nan=False); other
+            # tenants' interleaved records already on disk stay in place and
+            # shared-lease readers observe only the complete pre-commit or
+            # post-commit state. The records are returned in the input's
+            # physical order.
             chunks = [
                 json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
                 for item in records
