@@ -173,6 +173,14 @@ class _ForeignTenant(Exception):
         self.line = line
 
 
+class _Undecodable(Exception):
+    # Internal: a chunk stream hit its first undecodable byte. line is the
+    # 1-based physical line number _decode_lines would report for the
+    # concatenated bytes.
+    def __init__(self, line):
+        self.line = line
+
+
 class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
@@ -257,6 +265,94 @@ class AuditChain:
         bad_line = data.count(b"\n", 0, start) + 1
         cut = data.rfind(b"\n", 0, start) + 1  # start of the bad line
         return data[:cut].decode("utf-8").splitlines(), bad_line
+
+    @staticmethod
+    def _chunk_parts(chunks):
+        # Input boundary of the chunked verify entry points: chunks must be
+        # an iterable whose every element is bytes. A bare bytes (or
+        # bytearray/str) object is one byte string, not a chunk container,
+        # and any other element type is a caller error; every violation is
+        # ValueError, raised while consuming the iterable at the first
+        # offending element, never after pulling further elements. Returns
+        # the validated chunks as a list; an empty iterable is a legitimate
+        # empty history.
+        if isinstance(chunks, (bytes, bytearray, str)):
+            raise ValueError(
+                "chunks must be an iterable of bytes chunks, not a single "
+                f"{type(chunks).__name__}"
+            )
+        try:
+            iterator = iter(chunks)
+        except TypeError:
+            raise ValueError(
+                "chunks must be an iterable of bytes chunks, got "
+                f"{type(chunks).__name__}"
+            ) from None
+        parts = []
+        for chunk in iterator:
+            if not isinstance(chunk, bytes):
+                raise ValueError(
+                    f"each chunk must be bytes, got {type(chunk).__name__}"
+                )
+            parts.append(chunk)
+        return parts
+
+    @staticmethod
+    def _chunk_lines(chunks):
+        # Incremental counterpart of _decode_lines over already validated
+        # bytes chunks: yields exactly the physical lines _decode_lines
+        # would return for the concatenated bytes, in the same order, and
+        # raises _Undecodable with the same 1-based physical line number
+        # when the concatenation is not strict UTF-8. Chunks may be split at
+        # any byte -- inside a UTF-8 sequence, a line or a JSON record --
+        # and empty chunks are legal. A line is yielded only once the "\n"
+        # ending its region has arrived (or the stream ends), so a first
+        # undecodable byte still discards the unterminated text preceding
+        # it, exactly like _decode_lines' cut at the last "\n" before the
+        # bad byte.
+        pending = ""   # decoded text after the last committed "\n"
+        carry = b""    # bytes of an incomplete trailing UTF-8 sequence
+        newlines = 0   # "\n" bytes committed so far
+        for chunk in chunks:
+            buf = carry + chunk
+            try:
+                text = buf.decode("utf-8")
+                carry = b""
+                truncated = False
+            except UnicodeDecodeError as exc:
+                if exc.reason == "unexpected end of data":
+                    # Incomplete sequence at the chunk boundary: hold its
+                    # bytes back; the next chunk (or the end of the stream)
+                    # decides whether it completes.
+                    text = buf[:exc.start].decode("utf-8")
+                    carry = buf[exc.start:]
+                    truncated = False
+                else:
+                    text = buf[:exc.start].decode("utf-8")
+                    truncated = True
+            pending += text
+            segments = pending.split("\n")
+            for segment in segments[:-1]:
+                # A region ends with "\n", so a "\r\n" pair never straddles
+                # the boundary and per-region splitlines() concatenates to
+                # exactly splitlines() of the whole stream.
+                yield from (segment + "\n").splitlines()
+            newlines += len(segments) - 1
+            pending = segments[-1]
+            if truncated:
+                # First undecodable byte of the stream: every "\n"-
+                # terminated region before it has been yielded, the
+                # unterminated tail is discarded, and the bad byte sits on
+                # physical line (committed newlines) + 1 -- the same
+                # bad_line _decode_lines computes.
+                raise _Undecodable(newlines + 1)
+        if carry:
+            # The stream ends inside a UTF-8 sequence: _decode_lines
+            # reports the sequence's first byte, which sits on the line
+            # after the last committed "\n".
+            raise _Undecodable(newlines + 1)
+        if pending:
+            yield from pending.splitlines()
 
     @staticmethod
     def _tenant_key(tenant):
@@ -1094,6 +1190,13 @@ class AuditChain:
         # additionally attaches each tenant's verified tail digest, backing
         # the heads() entry point without changing verify_all's result shape.
         lines, bad_line = self._decode_lines(data)
+        return self._verify_all_lines(lines, bad_line, with_hash)
+
+    def _verify_all_lines(self, lines, bad_line=None, with_hash=False):
+        # verify_all's validation pass over already decoded physical lines,
+        # shared by the byte-snapshot entry points and the chunked stream
+        # entry point: same tenant identity, sequence, digest, first-error
+        # and tenant-order rules either way.
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
         for line, raw in enumerate(lines, 1):
@@ -1818,6 +1921,13 @@ class AuditChain:
         # but the bytes are given and never touched on disk. Backs both verify
         # (file snapshot) and verify_bytes (caller snapshot).
         lines, bad_line = self._decode_lines(data)
+        return self._verify_lines(tenant, lines, bad_line, expected_count)
+
+    def _verify_lines(self, tenant, lines, bad_line, expected_count=None):
+        # verify's validation pass over already decoded physical lines,
+        # shared by the byte-snapshot entry points and the chunked stream
+        # entry point: same scan, expected_count and first-error rules
+        # either way.
         try:
             count, _ = self._scan(tenant, lines, bad_line)
         except _Broken as b:
@@ -1872,3 +1982,57 @@ class AuditChain:
         if not isinstance(data, bytes):
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
         return self._verify_all_snapshot(data)
+
+    def verify_chunks(self, chunks, tenant, expected_count=None):
+        # Chunked offline counterpart of verify_bytes for large histories:
+        # the caller hands over the JSONL history as an iterable of bytes
+        # chunks in file order -- read from a stream, an archive or any
+        # other source -- instead of one concatenated buffer. The chunks may
+        # be split at any byte (inside a UTF-8 sequence, a line or a JSON
+        # record) and empty chunks are legal; their concatenation is exactly
+        # the history verified, and the result is field-for-field the
+        # verdict verify_bytes would return for those concatenated bytes,
+        # the expected_count check included. Like verify_bytes this consumes
+        # only the caller's data: it never reads, creates or modifies the
+        # configured path, never touches the network or a remote anchor, and
+        # writes no cache or on-disk index.
+        #
+        # Boundary first, mirroring verify_bytes' order: the chunk container
+        # must be an iterable of bytes (a bare bytes/bytearray/str is one
+        # byte string, not a container; any other element type is a caller
+        # error -- all ValueError, raised at the first offending element
+        # without consuming the iterable further), then the tenant crosses
+        # the same standard-JSON boundary as verify_bytes and expected_count
+        # must be None or a non-negative plain int. An empty chunk sequence
+        # is a legitimate empty history. The first defective physical line
+        # of the concatenated history decides the verdict -- later chunks
+        # never change it -- and no verified prefix is ever returned.
+        parts = self._chunk_parts(chunks)
+        _validate_json_value(tenant)
+        _validate_expected_count(expected_count)
+        try:
+            return self._verify_lines(
+                tenant, self._chunk_lines(parts), None, expected_count
+            )
+        except _Undecodable as u:
+            return {"ok": False, "at": u.line, "reason": "missing"}
+
+    def verify_all_chunks(self, chunks):
+        # Chunked offline counterpart of verify_all_bytes: the whole log as
+        # an iterable of bytes chunks in file order, verified with exactly
+        # verify_all_bytes' tenant identity, first-appearance order, count
+        # and first-error rules, so the result -- empty input included -- is
+        # field-for-field the verdict verify_all_bytes would return for the
+        # concatenated bytes. The chunk container follows the same boundary
+        # as verify_chunks (an iterable of bytes; anything else is
+        # ValueError, decided at the first offending element without
+        # consuming the iterable further). Like verify_all_bytes this
+        # consumes only the caller's data: it never reads, creates or
+        # modifies the configured path, never touches the network, and
+        # writes no cache or on-disk index.
+        parts = self._chunk_parts(chunks)
+        try:
+            return self._verify_all_lines(self._chunk_lines(parts))
+        except _Undecodable as u:
+            return {"ok": False, "at": u.line, "tenant": None,
+                    "reason": "missing"}
