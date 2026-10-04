@@ -2048,6 +2048,38 @@ class AuditChain:
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
         return self._verify_all_snapshot(data)
 
+    def heads_bytes(self, data):
+        # Pure in-memory, offline chain-head directory: the offline
+        # counterpart of heads(), validating a caller-supplied JSONL snapshot
+        # exactly the way heads() validates its shared-lease file snapshot.
+        # Like verify_all_bytes this consumes only the given memory: it never
+        # reads, creates or modifies the path this AuditChain points at, never
+        # touches the network and keeps no cache or on-disk index, and the
+        # buffer itself is never mutated.
+        #
+        # data must be bytes exactly as verify_all_bytes requires: bytearray,
+        # str and every other type are rejected with ValueError before any
+        # parsing, so no underlying decode/parse exception is ever leaked. The
+        # verification then reuses verify_all_bytes' exact strict UTF-8,
+        # LF-only physical-line, standard-JSON (duplicate keys and
+        # non-standard numbers rejected) rules and per-tenant chain rules from
+        # seq=1, prev=ZERO, so success has the exact shape heads() returns --
+        # {"ok": True, "tenants": [...]} with one entry per tenant in
+        # first-appearance physical order carrying the original tenant value,
+        # its verified count and its tail hash, the exact
+        # (expected_count, expected_hash) pair an offline conditional append
+        # needs; empty bytes are a successful empty history and yield
+        # {"ok": True, "tenants": []}. The first defect is reported with
+        # verify_all_bytes' exact failure object --
+        # {"ok": False, "at": line, "tenant": ..., "reason": ...}, tenant None
+        # when the line cannot name one -- reason missing for strict-decode/
+        # parse/object/required-field failures, sequence for a seq that is not
+        # that tenant's next one, digest for a prev/hash mismatch, and no
+        # partial tenant list is ever returned.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        return self._verify_all_snapshot(data, with_hash=True)
+
     @staticmethod
     def _join_chunks(chunks):
         # Validate and concatenate a chunked byte history. chunks must be an
@@ -2129,3 +2161,30 @@ class AuditChain:
         # container or a non-bytes element are all ValueError, a bad element
         # ending consumption at once.
         return self._verify_all_snapshot(self._join_chunks(chunks))
+
+    def heads_chunks(self, chunks):
+        # Chunked offline counterpart of heads_bytes: the caller supplies the
+        # JSONL snapshot whose chain heads are wanted as an ordered iterable of
+        # bytes chunks in file order instead of one contiguous buffer. Chunks
+        # may be cut at any byte boundary -- mid-UTF-8-sequence, mid-JSON,
+        # mid-line or mid-record -- and empty chunks are allowed; an empty
+        # iterable, or one holding only empty chunks, is the empty history.
+        # Only the in-order concatenation is ever decoded, so a split across a
+        # UTF-8 sequence, a JSON object or an LF changes no semantics: the
+        # result is field-for-field exactly what heads_bytes returns for the
+        # same concatenated bytes, and both are field-for-field what heads()
+        # returns for identical file contents. Like heads_bytes this consumes
+        # only caller data: it never reads, creates or modifies the configured
+        # path, never touches the network and keeps no cache or on-disk index.
+        # The container boundary is exactly verify_all_chunks' boundary: a
+        # bare bytes or bytearray object is not a chunk container, a
+        # non-iterable container or a non-bytes (bytearray included) element
+        # are all ValueError, the first bad element ending consumption at
+        # once. Success carries each tenant's original value, verified count
+        # and tail hash -- the (expected_count, expected_hash) pair an offline
+        # conditional append asserts -- in first-appearance physical order;
+        # the first defect is reported with verify_all_bytes' exact failure
+        # object and no partial tenant list is returned.
+        return self._verify_all_snapshot(
+            self._join_chunks(chunks), with_hash=True
+        )
