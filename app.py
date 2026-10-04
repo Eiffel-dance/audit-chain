@@ -1872,3 +1872,85 @@ class AuditChain:
         if not isinstance(data, bytes):
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
         return self._verify_all_snapshot(data)
+
+    @staticmethod
+    def _join_chunks(chunks):
+        # Validate and concatenate a chunked byte history. chunks must be an
+        # iterable whose every element is bytes; a bare bytes or bytearray
+        # object is not a chunk container (its iteration would yield ints)
+        # and raises ValueError up front, as does a non-iterable container.
+        # Element types are checked lazily while consuming: the first
+        # non-bytes element raises ValueError immediately, without pulling
+        # any further element from the iterable. Empty chunks are allowed and
+        # an empty iterable is the empty history. Chunks may be cut at any
+        # byte boundary -- mid-UTF-8-sequence, mid-line or mid-record --
+        # since only the concatenation is ever decoded.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        try:
+            iterator = iter(chunks)
+        except TypeError:
+            raise ValueError(
+                "chunks must be an iterable of bytes, got "
+                f"{type(chunks).__name__}"
+            ) from None
+        parts = []
+        for chunk in iterator:
+            if not isinstance(chunk, bytes):
+                raise ValueError(
+                    f"each chunk must be bytes, got {type(chunk).__name__}"
+                )
+            parts.append(chunk)
+        return b"".join(parts)
+
+    def verify_chunks(self, chunks, tenant, expected_count=None):
+        # Chunked offline counterpart of verify_bytes for large histories:
+        # the caller hands over the JSONL history as an iterable of bytes
+        # chunks in file order instead of one contiguous buffer, so the
+        # caller never has to assemble the full bytes itself. Chunks may be
+        # cut at any byte boundary (mid-UTF-8-sequence, mid-line, mid-record)
+        # and empty chunks are allowed; only their concatenation is the
+        # history. Like verify_bytes this consumes only caller data: it never
+        # reads, creates or modifies the configured path, never touches the
+        # network, and keeps no cache or on-disk index.
+        #
+        # Boundary first, in the exact order verify_bytes uses: the chunk
+        # container must be an iterable of bytes (a bare bytes or bytearray
+        # object, a non-iterable container or a non-bytes element are all
+        # ValueError, a bad element ending consumption at once), then the
+        # tenant crosses the same standard-JSON boundary as append/verify,
+        # then expected_count must be None or a non-negative plain int (bool
+        # rejected even though it subclasses int). The verdict over the
+        # concatenated bytes is field-for-field the verdict verify_bytes
+        # would return for the same bytes, including physical line numbers,
+        # first-error priority and the expected_count check.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        _validate_json_value(tenant)
+        _validate_expected_count(expected_count)
+        return self._verify_snapshot(
+            tenant, self._join_chunks(chunks), expected_count
+        )
+
+    def verify_all_chunks(self, chunks):
+        # Chunked offline counterpart of verify_all_bytes: every tenant chain
+        # in the history is validated over the concatenation of the given
+        # bytes chunks, supplied in file order. Chunks may be cut at any byte
+        # boundary and empty chunks are allowed; an empty iterable is a
+        # legitimate successful empty history. The result -- ok, at, tenant,
+        # reason on failure, or the tenant list with counts and
+        # first-appearance order on success -- is field-for-field the verdict
+        # verify_all_bytes would return for the concatenated bytes. Like
+        # verify_all_bytes this consumes only caller data: it never reads,
+        # creates or modifies the configured path, never touches the network,
+        # and keeps no cache or on-disk index. The container must be an
+        # iterable of bytes; a bare bytes or bytearray object, a non-iterable
+        # container or a non-bytes element are all ValueError, a bad element
+        # ending consumption at once.
+        return self._verify_all_snapshot(self._join_chunks(chunks))
