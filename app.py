@@ -2188,3 +2188,203 @@ class AuditChain:
         return self._verify_all_snapshot(
             self._join_chunks(chunks), with_hash=True
         )
+
+    def _validate_expected_heads(self, expected_heads):
+        # Shared input boundary of the verify_heads entry points.
+        # expected_heads must be a list; every member must be an object whose
+        # key set is exactly {"tenant", "count", "hash"}. The tenant crosses
+        # the same standard-JSON boundary as append/verify, count must be a
+        # non-negative plain int (bool is rejected even though it subclasses
+        # int; floats, strings and other types are too) and hash must be
+        # exactly the 64 lowercase hex characters of a sha256 digest (an
+        # empty chain is asserted with ZERO). A canonical JSON tenant
+        # identity may appear at most once; list order is kept, it decides
+        # conflict priority. Returns the assertions as (tenant, count, hash)
+        # tuples in list order. Everything is checked before any byte is
+        # read or parsed, so a malformed call raises ValueError regardless of
+        # snapshot state.
+        if not isinstance(expected_heads, list):
+            raise ValueError(
+                "expected_heads must be a list, got "
+                f"{type(expected_heads).__name__}"
+            )
+        assertions = []
+        seen = set()
+        for head in expected_heads:
+            if not isinstance(head, dict) or set(head) != {
+                "tenant", "count", "hash"
+            }:
+                raise ValueError(
+                    "each expected head must be an object containing exactly "
+                    f"the keys 'tenant', 'count' and 'hash', got {head!r}"
+                )
+            tenant = head["tenant"]
+            count = head["count"]
+            head_hash = head["hash"]
+            _validate_json_value(tenant)
+            if isinstance(count, bool) or not isinstance(count, int) \
+                    or count < 0:
+                raise ValueError(
+                    "count must be a non-negative integer, got "
+                    f"{count!r}"
+                )
+            if not isinstance(head_hash, str) or len(head_hash) != 64 \
+                    or any(c not in "0123456789abcdef" for c in head_hash):
+                raise ValueError(
+                    "hash must be 64 lowercase hexadecimal characters, got "
+                    f"{head_hash!r}"
+                )
+            key = self._tenant_key(tenant)
+            if key in seen:
+                raise ValueError(
+                    "duplicate tenant head (same canonical JSON identity): "
+                    f"{tenant!r}"
+                )
+            seen.add(key)
+            assertions.append((tenant, count, head_hash))
+        return assertions
+
+    def _verify_heads_snapshot(self, data, assertions):
+        # Core of the verify_heads entry points over an exact in-memory
+        # snapshot. assertions is the fully validated list of
+        # (tenant, count, hash) tuples in expected_heads order. The whole
+        # snapshot is first validated with verify_all_bytes/heads_bytes'
+        # exact strict UTF-8, LF physical-line, standard-JSON and
+        # missing/sequence/digest rules: the first defect returns that same
+        # failure object and no head is ever compared against an unverifiable
+        # history. Only then are heads compared: every asserted tenant in
+        # expected_heads order (a tenant absent from the snapshot has the
+        # fixed actual head (0, ZERO)), then every snapshot tenant the
+        # directory does not list, in first-appearance physical order,
+        # against the fixed expectation (0, ZERO). The first inequality
+        # raises AuditChainConflictError with that tenant's expectation and
+        # the actual verified tail. On full agreement the result is the
+        # heads_bytes success structure itself: the verified tenant directory
+        # in first-appearance order with original tenant values, counts and
+        # tail hashes.
+        result = self._verify_all_snapshot(data, with_hash=True)
+        if not result["ok"]:
+            return result
+        actual = {}
+        for entry in result["tenants"]:
+            actual[self._tenant_key(entry["tenant"])] = entry
+        for tenant, count, head_hash in assertions:
+            entry = actual.get(self._tenant_key(tenant))
+            if entry is None:
+                actual_count, actual_hash = 0, ZERO
+            else:
+                actual_count, actual_hash = entry["count"], entry["hash"]
+            if actual_count != count or actual_hash != head_hash:
+                raise AuditChainConflictError(
+                    tenant, count, head_hash, actual_count, actual_hash
+                )
+        listed = {self._tenant_key(t) for t, _c, _h in assertions}
+        for entry in result["tenants"]:
+            if self._tenant_key(entry["tenant"]) in listed:
+                continue
+            if entry["count"] != 0 or entry["hash"] != ZERO:
+                raise AuditChainConflictError(
+                    entry["tenant"], 0, ZERO, entry["count"], entry["hash"]
+                )
+        return result
+
+    def verify_heads(self, expected_heads):
+        # Expected-head verification of this log: prove that the chain-head
+        # directory a caller holds (e.g. one saved during a backup) matches
+        # the complete verified history, closing the gap verify_all leaves
+        # -- verify_all only proves the snapshot is internally consistent,
+        # not that it is the history the caller expects. Read-only: one
+        # shared-lease snapshot, exactly as verify_all/heads use, so the
+        # comparison corresponds to the full state wholly before or wholly
+        # after any concurrent append; nothing is created, modified or
+        # cached and the network is never touched.
+        #
+        # expected_heads must be a list whose members are objects carrying
+        # exactly the keys tenant, count and hash; the tenant crosses the
+        # same standard-JSON boundary as append/verify, count must be a
+        # non-negative plain int (bool rejected even though it subclasses
+        # int) and hash must be exactly 64 lowercase hex characters (an empty
+        # chain is asserted with ZERO); a canonical JSON tenant identity may
+        # appear at most once. All of that is checked before a single byte is
+        # read, so an illegal call raises ValueError regardless of log state
+        # or contention and creates nothing.
+        #
+        # The complete snapshot is then validated with the exact strict
+        # UTF-8, LF physical-line, standard-JSON and per-tenant
+        # missing/sequence/digest rules of verify_all: the first defect
+        # returns verify_all's failure object
+        # ({"ok": False, "at": line, "tenant": ..., "reason": ...}) and no
+        # head comparison happens against an unverifiable history. A valid
+        # snapshot is compared head by head: each asserted tenant in
+        # expected_heads order (a tenant missing from the log has the fixed
+        # actual head (0, ZERO)), then each log tenant the directory does not
+        # list, in first-appearance physical order, against the fixed
+        # expectation (0, ZERO). The first mismatch raises
+        # AuditChainConflictError with reason "conflict" and the tenant,
+        # expected_count, expected_hash, actual_count, actual_hash fields;
+        # no failure path ever writes a byte. Full agreement returns the
+        # heads() success structure: {"ok": True, "tenants": [...]} in
+        # first-appearance order with original tenant values, verified counts
+        # and tail hashes; an empty log matched against an empty directory
+        # yields {"ok": True, "tenants": []}.
+        assertions = self._validate_expected_heads(expected_heads)
+        return self._verify_heads_snapshot(self._read_snapshot(), assertions)
+
+    def verify_heads_bytes(self, data, expected_heads):
+        # Pure in-memory, offline counterpart of verify_heads: the caller
+        # hands over the raw bytes of a JSONL history plus the expected
+        # chain-head directory. Like verify_all_bytes/heads_bytes this
+        # consumes only the given memory: it never reads, creates or modifies
+        # the path this AuditChain points at, never touches the network and
+        # keeps no cache or on-disk index, and the buffer is never mutated.
+        #
+        # data must be bytes exactly as verify_all_bytes requires and
+        # expected_heads crosses the same boundary as verify_heads (a list of
+        # exactly {"tenant", "count", "hash"} objects, standard-JSON tenants,
+        # non-negative plain-int counts, 64 lowercase hex hashes, canonical
+        # tenant identities unique); both are checked before any parsing, so
+        # a malformed call raises ValueError without leaking an underlying
+        # decode/parse exception. The concatenated bytes are then validated
+        # and compared exactly as verify_heads does: the first snapshot
+        # defect returns verify_all_bytes' exact failure object with no head
+        # comparison; a valid snapshot is compared in expected_heads order
+        # (missing tenants actual (0, ZERO)) and then directory-less tenants
+        # in first-appearance order against (0, ZERO), the first mismatch
+        # raising AuditChainConflictError. Full agreement returns the
+        # heads_bytes success structure, so empty bytes matched against an
+        # empty directory yield {"ok": True, "tenants": []}.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        assertions = self._validate_expected_heads(expected_heads)
+        return self._verify_heads_snapshot(data, assertions)
+
+    def verify_heads_chunks(self, chunks, expected_heads):
+        # Chunked offline counterpart of verify_heads_bytes for large
+        # histories: the caller streams the JSONL snapshot as an ordered
+        # iterable of bytes chunks (cut at any byte boundary --
+        # mid-UTF-8-sequence, mid-line or mid-record -- empty chunks allowed)
+        # plus the expected chain-head directory; only the in-order
+        # concatenation is the snapshot. Like verify_heads_bytes this
+        # consumes only caller data: it never reads, creates or modifies the
+        # configured path, never touches the network and keeps no cache or
+        # on-disk index.
+        #
+        # The container boundary is exactly verify_all_chunks' boundary (a
+        # bare bytes or bytearray object is not a chunk container, a
+        # non-iterable container or a non-bytes element are all ValueError, a
+        # bad element ending consumption at once) and expected_heads crosses
+        # the same boundary as verify_heads; everything is checked before any
+        # parsing. The verdict over the concatenated bytes is field-for-field
+        # what verify_heads_bytes returns for the same bytes: the first
+        # snapshot defect is verify_all_bytes' failure object, the first head
+        # mismatch is AuditChainConflictError, and full agreement is the
+        # heads_bytes success structure in first-appearance order.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        assertions = self._validate_expected_heads(expected_heads)
+        return self._verify_heads_snapshot(
+            self._join_chunks(chunks), assertions
+        )
