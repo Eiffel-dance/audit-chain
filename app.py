@@ -1004,6 +1004,52 @@ class AuditChain:
             f.write(block)
             return items
 
+    def append_batch_stream(self, tenant, events):
+        # Streaming-input variant of append_batch: the caller hands over the
+        # same-tenant batch as a one-shot iterable of events instead of a
+        # materialized list. events must be an iterable; a bare bytes,
+        # bytearray, str or dict object is not an event stream (a dict would
+        # iterate its keys, the others their elements/characters) and a
+        # non-iterable value is not either -- all five raise ValueError up
+        # front, before the tenant boundary and before anything is pulled.
+        # The tenant crosses the same standard-JSON boundary as append
+        # before the first element is requested, so a malformed tenant never
+        # consumes a single event.
+        if isinstance(events, (bytes, bytearray, str, dict)):
+            raise ValueError(
+                "events must be an iterable of events, got a single "
+                f"{type(events).__name__} object"
+            )
+        try:
+            iterator = iter(events)
+        except TypeError:
+            raise ValueError(
+                "events must be an iterable of events, got "
+                f"{type(events).__name__}"
+            ) from None
+        _validate_json_value(tenant)
+        # The iterator is consumed exactly once, in produced order, and each
+        # produced event crosses the same standard-JSON boundary as in
+        # append the moment it arrives: the first illegal event raises
+        # ValueError without pulling another element, before any path is
+        # touched or history read. An exception raised by the iterator
+        # itself propagates unchanged; no byte has been written at that
+        # point (or ever is, on any boundary failure), because the lease is
+        # taken only after the whole batch has validated.
+        drained = []
+        for event in iterator:
+            _validate_json_value(event)
+            drained.append(event)
+        # An empty stream is a no-op exactly like append_batch's empty list:
+        # nothing is created, read or changed. A non-empty drained batch is
+        # committed by append_batch itself, so the scan, the AuditChainStateError
+        # fields, the seq/prev/hash assignment, the serialization, the
+        # newline completion, the single indivisible block write and the
+        # returned five-field records are byte-for-byte and field-for-field
+        # identical to calling append_batch with the same event sequence on
+        # the same history.
+        return self.append_batch(tenant, drained)
+
     def _append_batch_if_head_locked(self, f, tenant, events,
                                      expected_count, expected_hash):
         # Scan, compare and append on a description already holding the
