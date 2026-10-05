@@ -426,17 +426,33 @@ class AuditChain:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _scan(self, tenant, lines, bad_line=None):
-        # Validate the target tenant's chain over the decoded JSONL lines.
-        # Returns (verified_count, last_hash). Raises _Broken at the first
-        # problem; records of other tenants may interleave and are skipped.
-        # Tenant matching uses the same canonical JSON identity as
-        # verify_all, never host-language loose equality. If bad_line is
-        # given, an undecodable physical line follows the lines provided;
-        # it is reported as missing only when no earlier problem was found.
+    @staticmethod
+    def _lines_events(lines, bad_line=None):
+        # Adapt an already-decoded physical-line list (plus the optional
+        # 1-based number of an undecodable physical line following them) to
+        # the (kind, line, text) event stream the streaming scans consume:
+        # one ("line", n, text) event per physical line, then a single
+        # ("bad", bad_line, None) marker when an undecodable line follows.
+        events = [("line", n, raw) for n, raw in enumerate(lines, 1)]
+        if bad_line is not None:
+            events.append(("bad", bad_line, None))
+        return events
+
+    def _scan_events(self, tenant, events):
+        # Validate the target tenant's chain over a (kind, line, text) event
+        # stream, pulled lazily: the exact per-tenant rules _scan documents
+        # (canonical JSON tenant identity, records of other tenants skipped,
+        # seqs 1..n from a ZERO prev, every digest recomputed), evaluated
+        # event by event so a streaming caller stops pulling input the
+        # moment the first defect is found. Returns (verified_count,
+        # last_hash). Raises _Broken at the first problem with the same
+        # reason/at/line/expect filling _scan documents.
         key = self._tenant_key(tenant)
         expected, prev, count = 1, ZERO, 0
-        for line, raw in enumerate(lines, 1):
+        for kind, line, raw in events:
+            if kind != "line":
+                # An undecodable physical line: tenant cannot be parsed.
+                raise _Broken("missing", None, line, expected)
             try:
                 item = _strict_loads(raw)
             except Exception:
@@ -466,9 +482,19 @@ class AuditChain:
             count += 1
             prev = item["hash"]
             expected += 1
-        if bad_line is not None:
-            raise _Broken("missing", None, bad_line, expected)
         return count, prev
+
+    def _scan(self, tenant, lines, bad_line=None):
+        # Validate the target tenant's chain over the decoded JSONL lines.
+        # Returns (verified_count, last_hash). Raises _Broken at the first
+        # problem; records of other tenants may interleave and are skipped.
+        # Tenant matching uses the same canonical JSON identity as
+        # verify_all, never host-language loose equality. If bad_line is
+        # given, an undecodable physical line follows the lines provided;
+        # it is reported as missing only when no earlier problem was found.
+        return self._scan_events(
+            tenant, self._lines_events(lines, bad_line)
+        )
 
     def _scan_import(self, tenant, lines, bad_line=None):
         # Validate an offline single-tenant export before it is grafted onto
@@ -1238,17 +1264,20 @@ class AuditChain:
         with self._heads_lease(norm) as f:
             return self._append_many_if_heads_locked(f, norm)
 
-    def _verify_all_snapshot(self, data, with_hash=False):
-        # Core of verify_all over an exact in-memory snapshot. Touches no path:
-        # the caller owns how the bytes were obtained (a shared-lease file read
-        # or a caller-supplied buffer), so the same logic backs both
-        # verify_all and the offline verify_all_bytes entry point. with_hash
-        # additionally attaches each tenant's verified tail digest, backing
-        # the heads() entry point without changing verify_all's result shape.
-        lines, bad_line = self._decode_lines(data)
+    def _verify_all_events(self, events, with_hash=False):
+        # Validate every tenant chain over a (kind, line, text) event stream
+        # in one physical-order pass, pulled lazily: the exact rules
+        # _verify_all_snapshot documents, evaluated event by event so a
+        # streaming caller stops pulling input the moment the first defect
+        # is found. The verdict object is field-for-field the one
+        # _verify_all_snapshot builds over the same lines.
         states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
         order = []   # (tenant_value, state) in first-appearance order
-        for line, raw in enumerate(lines, 1):
+        for kind, line, raw in events:
+            if kind != "line":
+                # First undecodable byte: tenant cannot be parsed, so None.
+                return {"ok": False, "at": line, "tenant": None,
+                        "reason": "missing"}
             try:
                 item = _strict_loads(raw)
             except Exception:
@@ -1279,9 +1308,6 @@ class AuditChain:
             state[0] += 1
             state[1] = item["hash"]
             state[2] += 1
-        if bad_line is not None:
-            # First undecodable byte: tenant cannot be parsed, so None.
-            return {"ok": False, "at": bad_line, "tenant": None, "reason": "missing"}
         # state[1] is the running prev hash, which after a tenant's last
         # record is exactly that tenant's verified tail digest.
         tenants = []
@@ -1291,6 +1317,18 @@ class AuditChain:
                 entry["hash"] = s[1]
             tenants.append(entry)
         return {"ok": True, "tenants": tenants}
+
+    def _verify_all_snapshot(self, data, with_hash=False):
+        # Core of verify_all over an exact in-memory snapshot. Touches no path:
+        # the caller owns how the bytes were obtained (a shared-lease file read
+        # or a caller-supplied buffer), so the same logic backs both
+        # verify_all and the offline verify_all_bytes entry point. with_hash
+        # additionally attaches each tenant's verified tail digest, backing
+        # the heads() entry point without changing verify_all's result shape.
+        lines, bad_line = self._decode_lines(data)
+        return self._verify_all_events(
+            self._lines_events(lines, bad_line), with_hash
+        )
 
     def _parse_all_snapshot(self, data):
         # Parse an already-verified in-memory snapshot into per-tenant records
@@ -2655,6 +2693,80 @@ class AuditChain:
             parts.append(chunk)
         return b"".join(parts)
 
+    @staticmethod
+    def _stream_iterator(chunks):
+        # Eager half of the streaming chunk-container boundary: chunks must
+        # be an iterable. A non-iterable container raises ValueError
+        # immediately, before a single element is pulled; element types are
+        # checked lazily by _iter_stream_events while consuming. The bare
+        # bytes/bytearray rejection lives in the public stream entry points
+        # (mirroring verify_chunks), so it is decided before this call.
+        try:
+            return iter(chunks)
+        except TypeError:
+            raise ValueError(
+                "chunks must be an iterable of bytes, got "
+                f"{type(chunks).__name__}"
+            ) from None
+
+    @staticmethod
+    def _iter_stream_events(iterator, digest=None):
+        # Pull bytes chunks from iterator lazily and yield the JSONL history
+        # as a (kind, line, text) event stream: one ("line", n, text) event
+        # per LF-bounded physical line, in file order, or a single
+        # ("bad", n, None) event for the first physical line whose bytes are
+        # not strict UTF-8 (the stream then ends, exactly the stop point
+        # _decode_lines computes for the same bytes). Chunks may be cut at
+        # any byte boundary -- mid-UTF-8-sequence, mid-line or mid-record --
+        # and empty chunks are allowed: bytes are accumulated until a
+        # physical line is complete, and only complete lines are decoded
+        # (0x0A can never be part of a multi-byte UTF-8 sequence, so
+        # LF-splitting before decoding is exactly whole-buffer decoding).
+        # A non-bytes element raises ValueError the moment it is pulled,
+        # ending consumption without pulling any further element. A trailing
+        # line without a final LF is yielded when the iterator is exhausted;
+        # an empty stream yields no events. When digest is given it must be
+        # a [length, hasher] pair updated with every chunk as it is pulled,
+        # so a caller that consumes the stream to its end holds the exact
+        # byte length and running sha256 of the concatenation without ever
+        # assembling it. Each chunk is pulled only when the events produced
+        # so far have been consumed, so a scan that stops at a defect never
+        # pulls the chunks following it.
+        buffer = b""
+        line = 0
+        for chunk in iterator:
+            if not isinstance(chunk, bytes):
+                raise ValueError(
+                    f"each chunk must be bytes, got {type(chunk).__name__}"
+                )
+            if digest is not None:
+                digest[0] += len(chunk)
+                digest[1].update(chunk)
+            buffer += chunk
+            start = 0
+            while True:
+                cut = buffer.find(b"\n", start)
+                if cut < 0:
+                    break
+                raw = buffer[start:cut]
+                line += 1
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    yield ("bad", line, None)
+                    return
+                yield ("line", line, text)
+                start = cut + 1
+            buffer = buffer[start:]
+        if buffer:
+            line += 1
+            try:
+                text = buffer.decode("utf-8")
+            except UnicodeDecodeError:
+                yield ("bad", line, None)
+                return
+            yield ("line", line, text)
+
     def verify_chunks(self, chunks, tenant, expected_count=None):
         # Chunked offline counterpart of verify_bytes for large histories:
         # the caller hands over the JSONL history as an iterable of bytes
@@ -2730,6 +2842,121 @@ class AuditChain:
         return self._verify_all_snapshot(
             self._join_chunks(chunks), with_hash=True
         )
+
+    def verify_stream(self, chunks, tenant, expected_count=None):
+        # Single-consumption streaming counterpart of verify_bytes: the JSONL
+        # history arrives as an iterable of bytes chunks in file order and is
+        # verified record by record as the bytes arrive, so the caller never
+        # assembles the full buffer and this entry never holds one. Chunks
+        # may be cut at any byte boundary (mid-UTF-8-sequence, mid-line,
+        # mid-record) and empty chunks are allowed; only their in-order
+        # concatenation is the history, and an empty iterable is the empty
+        # history. The iterable is consumed at most once, inside this call;
+        # like verify_bytes this consumes only caller data -- it never reads,
+        # creates or modifies the configured path, never touches the network
+        # and keeps no cache or on-disk index.
+        #
+        # Boundary first, in the exact order verify_chunks uses: a bare bytes
+        # or bytearray object is not a chunk container (its iteration would
+        # yield ints), then the tenant crosses the same standard-JSON
+        # boundary as append/verify, then expected_count must be None or a
+        # non-negative plain int (bool rejected even though it subclasses
+        # int), then the container must be iterable -- every malformed
+        # argument raises ValueError before a single chunk is pulled. A
+        # non-bytes element raises ValueError the moment it is pulled, ending
+        # consumption at once.
+        #
+        # The verdict is field-for-field the verdict verify_bytes returns for
+        # the concatenated bytes -- strict UTF-8, LF-only physical lines,
+        # standard JSON, canonical tenant identity, seq continuity, prev/hash
+        # chain, first-error priority and the expected_count check -- but
+        # consumption stops the moment the outcome is decided: a parse,
+        # field, sequence or digest defect (or the first undecodable line)
+        # returns the missing/sequence/digest verdict without pulling any
+        # further chunk, and only a history whose records all verify is
+        # consumed to its end.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        _validate_json_value(tenant)
+        _validate_expected_count(expected_count)
+        events = self._iter_stream_events(self._stream_iterator(chunks))
+        try:
+            count, _ = self._scan_events(tenant, events)
+        except _Broken as b:
+            return {"ok": False, "at": b.at if b.at is not None else b.line,
+                    "reason": b.reason}
+        if expected_count is not None:
+            if count < expected_count:
+                return {"ok": False, "at": count + 1, "reason": "missing"}
+            if count > expected_count:
+                return {"ok": False, "at": expected_count + 1,
+                        "reason": "sequence"}
+        return {"ok": True, "count": count}
+
+    def verify_all_stream(self, chunks):
+        # Single-consumption streaming counterpart of verify_all_bytes: every
+        # tenant chain in the history is validated record by record as the
+        # bytes chunks arrive, in file order, without ever assembling the
+        # concatenation. Chunks may be cut at any byte boundary and empty
+        # chunks are allowed; an empty iterable is a legitimate successful
+        # empty history. The iterable is consumed at most once, inside this
+        # call; like verify_all_bytes this consumes only caller data and
+        # never reads, creates or modifies the configured path, never touches
+        # the network and keeps no cache or on-disk index.
+        #
+        # The container boundary is exactly verify_all_chunks': a bare bytes
+        # or bytearray object is not a chunk container, a non-iterable
+        # container is ValueError before any element is pulled, and a
+        # non-bytes element is ValueError the moment it is pulled, ending
+        # consumption at once. The result -- ok, at, tenant, reason on
+        # failure, or the tenant list with counts and first-appearance order
+        # on success -- is field-for-field the verdict verify_all_bytes
+        # returns for the concatenated bytes, but consumption stops the
+        # moment the first defect is found: no further chunk is pulled and no
+        # partial tenant list is returned; only a fully valid history is
+        # consumed to its end.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        events = self._iter_stream_events(self._stream_iterator(chunks))
+        return self._verify_all_events(events)
+
+    def heads_stream(self, chunks):
+        # Single-consumption streaming counterpart of heads_bytes: the chain-
+        # head directory of every tenant in the history is built record by
+        # record as the bytes chunks arrive, in file order, without ever
+        # assembling the concatenation. Chunks may be cut at any byte
+        # boundary and empty chunks are allowed; an empty iterable (or one
+        # holding only empty chunks) is the empty history. The iterable is
+        # consumed at most once, inside this call; like heads_bytes this
+        # consumes only caller data and never reads, creates or modifies the
+        # configured path, never touches the network and keeps no cache or
+        # on-disk index.
+        #
+        # The container boundary is exactly heads_chunks': a bare bytes or
+        # bytearray object is not a chunk container, a non-iterable container
+        # is ValueError before any element is pulled, and a non-bytes element
+        # is ValueError the moment it is pulled, ending consumption at once.
+        # Success carries each tenant's original value, verified count and
+        # tail hash -- the (expected_count, expected_hash) pair an offline
+        # conditional append asserts -- in first-appearance physical order,
+        # field-for-field exactly what heads_bytes returns for the same
+        # concatenated bytes; the first defect is reported with
+        # verify_all_bytes' exact failure object, consumption stops there
+        # without pulling any further chunk, and no partial tenant list is
+        # returned. Only a fully valid history is consumed to its end.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        events = self._iter_stream_events(self._stream_iterator(chunks))
+        return self._verify_all_events(events, with_hash=True)
 
     def _verify_heads_snapshot(self, data, assertions):
         # Core of verify_heads over an exact in-memory snapshot. Touches no
@@ -2979,6 +3206,106 @@ class AuditChain:
         # snapshot raises AuditChainStateError with the same fields as
         # manifest_bytes, never a partial manifest.
         return self._manifest_snapshot(self._join_chunks(chunks))
+
+    def manifest_stream(self, chunks):
+        # Single-consumption streaming counterpart of manifest_bytes: the
+        # snapshot arrives as an iterable of bytes chunks in file order and
+        # the version-1 manifest is built record by record as the bytes
+        # arrive, without ever assembling the concatenation. Chunks may be
+        # cut at any byte boundary -- mid-UTF-8-sequence, mid-line or
+        # mid-record -- and empty chunks are allowed; an empty iterable (or
+        # one holding only empty chunks) is the empty snapshot. The iterable
+        # is consumed at most once, inside this call; like manifest_bytes
+        # this consumes only caller data: it never reads, creates or modifies
+        # the configured path, never touches the network and keeps no cache.
+        #
+        # The container boundary is exactly manifest_chunks': a bare bytes or
+        # bytearray object is not a chunk container, a non-iterable container
+        # is ValueError before any element is pulled, and a non-bytes element
+        # is ValueError the moment it is pulled, ending consumption at once.
+        #
+        # The whole stream is validated with the exact verify_all/export_all
+        # chain rules (strict UTF-8, LF-only physical lines, standard JSON,
+        # canonical tenant identity, per-tenant seq, prev and hash) before
+        # any manifest is produced: the first defect raises
+        # AuditChainStateError with tenant/seq/reason/line filled exactly the
+        # way manifest_bytes fills them -- reason only missing/sequence/
+        # digest, never leaking the underlying Unicode or JSON exception --
+        # consumption stops there without pulling any further chunk, and no
+        # partial manifest is ever produced. Only a fully valid history is
+        # consumed to its end; the returned manifest is then field-for-field
+        # what manifest_bytes returns for the same concatenated bytes:
+        # version 1, byte_length and byte_sha256 computed over the exact
+        # concatenated bytes (tracked incrementally as the chunks arrive),
+        # and the tenants in physical first-appearance order, each carrying
+        # its original tenant value, verified count and last record's hash.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        digest = [0, hashlib.sha256()]
+        events = self._iter_stream_events(
+            self._stream_iterator(chunks), digest
+        )
+        states = {}  # serialized tenant -> [expected_seq, prev_hash, count]
+        order = []   # (tenant_value, state) in first-appearance order
+        for kind, line, raw in events:
+            if kind != "line":
+                # First undecodable byte: tenant cannot be parsed, so None.
+                raise AuditChainStateError(
+                    None, None, "missing", line) from None
+            try:
+                item = _strict_loads(raw)
+            except Exception:
+                raise AuditChainStateError(
+                    None, None, "missing", line) from None
+            if not isinstance(item, dict) or "tenant" not in item:
+                raise AuditChainStateError(
+                    None, None, "missing", line) from None
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            state = states.get(key)
+            if state is None:
+                state = [1, ZERO, 0]
+                states[key] = state
+                order.append((tenant, state))
+            expected, prev, _ = state
+            if any(k not in item for k in FIELDS):
+                seq = item.get("seq")
+                at = seq if isinstance(seq, int) \
+                    and not isinstance(seq, bool) else expected
+                raise AuditChainStateError(
+                    tenant, at, "missing", line) from None
+            seq = item["seq"]
+            # Same strict JSON-integer seq rule as _scan_all_chains: 1.0/1e0,
+            # bools, strings, null, arrays/objects and mismatching integers
+            # are all sequence defects, so this scan agrees with every other
+            # entry point.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or seq != expected:
+                raise AuditChainStateError(
+                    tenant, expected, "sequence", line) from None
+            if item["prev"] != prev:
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            if item["hash"] != self._hash(item):
+                raise AuditChainStateError(
+                    tenant, expected, "digest", line) from None
+            state[0] += 1
+            state[1] = item["hash"]
+            state[2] += 1
+        # state[1] is the running prev hash, which after a tenant's last
+        # record is exactly that tenant's verified tail digest.
+        return {
+            "version": MANIFEST_VERSION,
+            "byte_length": digest[0],
+            "byte_sha256": digest[1].hexdigest(),
+            "tenants": [
+                {"tenant": tenant, "count": state[2], "hash": state[1]}
+                for tenant, state in order
+            ],
+        }
 
     def _verify_manifest_snapshot(self, data, manifest):
         # Core of verify_manifest over an exact in-memory snapshot. Touches
