@@ -2128,6 +2128,112 @@ class AuditChain:
         return self._verify_all_snapshot(data, with_hash=True)
 
     @staticmethod
+    def _snapshot_records(data):
+        # Index an already-validated snapshot's records by canonical JSON
+        # tenant identity, each tenant's list in physical (hence seq) order.
+        # Only called after _verify_all_snapshot has cleared the bytes, so
+        # every line decodes and parses and carries the full FIELDS set; the
+        # original tenant value of a shared identity may differ textually
+        # between the sides (object key order), so the canonical key is the
+        # only safe join.
+        records = {}
+        lines, _ = AuditChain._decode_lines(data)
+        for raw in lines:
+            item = _strict_loads(raw)
+            records.setdefault(AuditChain._tenant_key(item["tenant"]),
+                               []).append(item)
+        return records
+
+    def compare_bytes(self, left_data, right_data):
+        # Pure in-memory backup reconciliation: compare two caller-supplied
+        # JSONL snapshots record by record. Like verify_all_bytes this
+        # consumes only the given buffers -- it never reads, creates or
+        # modifies the path this AuditChain points at, never touches the
+        # network and keeps no cache; neither buffer is mutated.
+        #
+        # Both arguments must be bytes exactly as verify_all_bytes requires:
+        # bytearray, str and every other type raise ValueError before either
+        # snapshot is parsed. Each side is then validated with
+        # verify_all_bytes' exact rules (strict UTF-8, LF-only physical
+        # lines, standard JSON with duplicate keys and non-standard numbers
+        # rejected, the five required fields, per-tenant seq from 1, prev
+        # from ZERO and recomputed digests). A corrupt side ends the call
+        # without any comparison as
+        # {"ok": False, "side": "left"/"right", "at": line, "tenant": ...,
+        # "reason": "missing"/"sequence"/"digest"} -- the side's
+        # verify_all_bytes failure object plus the side label; when both
+        # sides are corrupt left is always reported first.
+        #
+        # Two valid snapshots are aligned by canonical JSON tenant identity
+        # and seq, so tenants interleaving in different physical orders on
+        # the two sides are not a difference. Tenants are visited in left's
+        # first-appearance order followed by right's remaining tenants in
+        # right's first-appearance order, and each tenant keeps the original
+        # value of that first appearance. A tenant absent from one side is
+        # treated as an empty chain there; two empty snapshots are equal.
+        # Records are compared from seq 1 by logical value (event, prev,
+        # hash); the first difference ends the call as
+        # {"ok": True, "equal": False, "tenant": ..., "seq": ...,
+        # "reason": ..., "left": ..., "right": ...} with reason "different"
+        # when both sides hold a record at that seq whose event, prev or
+        # hash differs, "missing_left"/"missing_right" when only one side
+        # has it, the missing side's field None. Exactly that one position
+        # is reported -- the digest chain makes later records differ too,
+        # and those cascade differences are never listed. Full equality
+        # returns {"ok": True, "equal": True, "tenants": [...]} with one
+        # entry per tenant in the visit order above, carrying the original
+        # tenant value, its record count and its tail hash.
+        if not isinstance(left_data, bytes):
+            raise ValueError(
+                f"left_data must be bytes, got {type(left_data).__name__}")
+        if not isinstance(right_data, bytes):
+            raise ValueError(
+                f"right_data must be bytes, got {type(right_data).__name__}")
+        left = self._verify_all_snapshot(left_data, with_hash=True)
+        if not left["ok"]:
+            return {"ok": False, "side": "left", "at": left["at"],
+                    "tenant": left["tenant"], "reason": left["reason"]}
+        right = self._verify_all_snapshot(right_data, with_hash=True)
+        if not right["ok"]:
+            return {"ok": False, "side": "right", "at": right["at"],
+                    "tenant": right["tenant"], "reason": right["reason"]}
+        left_records = self._snapshot_records(left_data)
+        right_records = self._snapshot_records(right_data)
+        # Visit order: left's first-appearance order, then the tenants only
+        # right knows, in right's first-appearance order. The summary entry
+        # of each side already carries that side's original tenant value,
+        # verified count and tail hash.
+        seen = {self._tenant_key(entry["tenant"]) for entry in left["tenants"]}
+        merged = list(left["tenants"]) + [
+            entry for entry in right["tenants"]
+            if self._tenant_key(entry["tenant"]) not in seen
+        ]
+        for entry in merged:
+            key = self._tenant_key(entry["tenant"])
+            lrecs = left_records.get(key, [])
+            rrecs = right_records.get(key, [])
+            for seq in range(1, max(len(lrecs), len(rrecs)) + 1):
+                litem = lrecs[seq - 1] if seq <= len(lrecs) else None
+                ritem = rrecs[seq - 1] if seq <= len(rrecs) else None
+                if litem is None:
+                    reason = "missing_left"
+                elif ritem is None:
+                    reason = "missing_right"
+                elif any(litem[f] != ritem[f] for f in ("event", "prev", "hash")):
+                    reason = "different"
+                else:
+                    continue
+                return {"ok": True, "equal": False,
+                        "tenant": entry["tenant"], "seq": seq,
+                        "reason": reason, "left": litem, "right": ritem}
+        tenants = [
+            {"tenant": entry["tenant"], "count": entry["count"],
+             "hash": entry["hash"]}
+            for entry in merged
+        ]
+        return {"ok": True, "equal": True, "tenants": tenants}
+
+    @staticmethod
     def _join_chunks(chunks):
         # Validate and concatenate a chunked byte history. chunks must be an
         # iterable whose every element is bytes; a bare bytes or bytearray
