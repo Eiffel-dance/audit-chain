@@ -954,6 +954,42 @@ class AuditChain:
             f.write(record)
             return item
 
+    def _append_batch_locked(self, f, tenant, events):
+        # Scan, build and append on a description already holding the
+        # exclusive data-file lease. Shared verbatim by append_batch and
+        # append_batch_stream, so a list and a single-consumption iterable
+        # carrying the same tenant and events over the same history always
+        # produce the same records and the exact same JSONL bytes. The
+        # tenant's full chain is scanned first with the exact rules append
+        # runs; a corrupt history raises AuditChainStateError (same
+        # tenant/seq/reason/line as append) and nothing is compared or
+        # written. The first record continues the chain tail observed inside
+        # the lease; each later record links to the previous record built
+        # here, and one block write commits the whole interval.
+        data = f.read()
+        lines, bad_line = self._decode_lines(data)
+        try:
+            count, prev = self._scan(tenant, lines, bad_line)
+        except _Broken as b:
+            seq = b.at if b.at is not None else b.expect
+            raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
+        items = []
+        chunks = []
+        for event in events:
+            item = {"tenant": tenant, "seq": count + 1,
+                    "event": event, "prev": prev}
+            item["hash"] = self._hash(item)
+            items.append(item)
+            chunks.append(
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            )
+            count += 1
+            prev = item["hash"]
+        prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+        block = prefix + "".join(chunks).encode("utf-8")
+        f.write(block)
+        return items
+
     def append_batch(self, tenant, events):
         # Append a group of same-tenant events as one verifiable interval.
         # events must be a list (a bare JSON value, including a string, is
@@ -978,31 +1014,72 @@ class AuditChain:
             # between two of its records. The records are emitted as one
             # byte block at the current end of file, so readers under the
             # shared lease likewise see either the whole batch or none of
-            # it. The first record continues the tenant chain found on disk;
-            # each later record links to the previous record of the batch.
-            data = f.read()
-            lines, bad_line = self._decode_lines(data)
-            try:
-                count, prev = self._scan(tenant, lines, bad_line)
-            except _Broken as b:
-                seq = b.at if b.at is not None else b.expect
-                raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
-            items = []
-            chunks = []
-            for event in events:
-                item = {"tenant": tenant, "seq": count + 1,
-                        "event": event, "prev": prev}
-                item["hash"] = self._hash(item)
-                items.append(item)
-                chunks.append(
-                    json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
-                )
-                count += 1
-                prev = item["hash"]
-            prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
-            block = prefix + "".join(chunks).encode("utf-8")
-            f.write(block)
-            return items
+            # it. The locked body is shared with append_batch_stream, which
+            # is why the two entries' committed bytes are identical for the
+            # same events over the same history.
+            return self._append_batch_locked(f, tenant, events)
+
+    def append_batch_stream(self, tenant, events):
+        # Streaming counterpart of append_batch: the same-tenant events
+        # arrive as a one-shot iterable consumed exactly once, in production
+        # order, instead of a materialized list. A bare bytes, bytearray or
+        # str is not an event container (iterating it would yield ints or
+        # characters), a bare dict is one event object rather than a batch
+        # of them, and a non-iterable value is not a batch either; all are
+        # caller errors and raise ValueError. The tenant and every produced
+        # event cross the same standard-JSON boundary as append/append_batch
+        # (non-string object keys, cyclic containers, non-finite numbers and
+        # values without a standard JSON encoding are ValueError). The
+        # container shape, the tenant and the whole stream -- every produced
+        # event included -- are all validated before a lease is taken, a
+        # path is probed or a single history byte is read, so no malformed
+        # call can depend on contention or history state. An exception the
+        # iterator raises before it finishes propagates verbatim (it is not
+        # wrapped in ValueError) and, like every other pre-lease failure,
+        # writes nothing. An empty iterator is a no-op returning []: no file
+        # is created, no history is read and no byte changes.
+        if isinstance(events, (bytes, bytearray, str, dict)):
+            raise ValueError(
+                "events must be an iterable of events, got a single "
+                f"{type(events).__name__} object"
+            )
+        _validate_json_value(tenant)
+        # The residual shape test is duck-typed: obtaining the iterator is
+        # also this entry's only pull on the container, so a non-iterable
+        # value ends as ValueError here while a valid iterator is not started
+        # until the tenant boundary has crossed.
+        try:
+            iterator = iter(events)
+        except TypeError:
+            raise ValueError(
+                "events must be an iterable of events, got "
+                f"{type(events).__name__}"
+            ) from None
+        # Materialize only after every boundary has crossed: this is the
+        # single consumption of the iterator (it is never read again, inside
+        # or outside the lease), and each produced event is validated as it
+        # arrives, so a bad event -- or an iterator that raises -- ends the
+        # call before the lease and any history read.
+        materialized = []
+        for event in iterator:
+            _validate_json_value(event)
+            materialized.append(event)
+        if not materialized:
+            return []
+        with self._write_lease() as f:
+            # Identical indivisible commit as append_batch: one exclusive
+            # lease on the description used for both reading and writing
+            # covers the full-chain scan and the single block write, so the
+            # batch serializes wholly before or wholly after competing
+            # writes and shared-lease readers observe only the complete
+            # pre-commit or post-commit history. The first record continues
+            # the actual chain tail (or ZERO on an empty chain), each later
+            # one links the previous record of the batch. Serialization,
+            # hashing and the missing-newline prefix are exactly
+            # append_batch's, so the committed JSONL bytes are byte-for-byte
+            # what append_batch produces for the same events over the same
+            # history.
+            return self._append_batch_locked(f, tenant, materialized)
 
     def _append_batch_if_head_locked(self, f, tenant, events,
                                      expected_count, expected_hash):
