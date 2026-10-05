@@ -1378,6 +1378,40 @@ class AuditChain:
             })
         return {"ok": True, "equal": True, "tenants": tenants}
 
+    def compare_chunks(self, left_chunks, right_chunks):
+        # Chunked offline counterpart of compare_bytes: the caller supplies
+        # each JSONL snapshot as an ordered iterable of bytes chunks instead
+        # of one contiguous buffer, so neither side has to be assembled into
+        # a single bytes object first. Chunks may be cut at any byte boundary
+        # -- mid-UTF-8-sequence, mid-JSON, mid-line or mid-record -- and
+        # empty chunks are allowed; an empty iterable, or one holding only
+        # empty chunks, is the empty snapshot. Only each side's in-order
+        # concatenation is ever decoded, so the result is field-for-field
+        # exactly what compare_bytes returns for the same concatenated
+        # bytes. Like compare_bytes this consumes only caller data: it never
+        # reads, creates or modifies the configured path, never touches the
+        # network, and never mutates the supplied chunks.
+        #
+        # The container boundary crosses first, left side before right side,
+        # before any byte of either snapshot is decoded: a bare bytes or
+        # bytearray object is not a chunk container (its iteration would
+        # yield ints), a non-iterable container or a non-bytes element
+        # (bytearray included) are all ValueError, and the first bad element
+        # ends consumption of that side at once -- no further chunk is
+        # pulled. A left boundary error is raised before the right container
+        # is touched at all, so it always takes priority over a right one,
+        # and every boundary error takes priority over any content verdict.
+        # Once both concatenations exist, the strict UTF-8 / LF-line /
+        # standard-JSON / seq-prev-hash validation, the corrupt-side report
+        # (ok/side/at/tenant/reason, left first) and the equal/tenants or
+        # first-difference result (different/missing_left/missing_right with
+        # the original records or None attached, never a cascade) are exactly
+        # compare_bytes'.
+        return self.compare_bytes(
+            self._join_chunks(left_chunks),
+            self._join_chunks(right_chunks),
+        )
+
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
         # physical line order. Each tenant gets an independent expected seq and
