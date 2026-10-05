@@ -299,6 +299,218 @@ class _ForeignTenant(Exception):
         self.line = line
 
 
+class _StreamScan:
+    # Internal incremental engine behind the single-consumption streaming
+    # entry points (verify_stream, verify_all_stream, heads_stream and
+    # manifest_stream). The history arrives as an ordered iterable of bytes
+    # chunks and is validated one chunk at a time, so the caller never has to
+    # assemble the full bytes: chunks may be cut at any byte boundary
+    # (mid-UTF-8-sequence, mid-JSON-object or mid-LF), empty chunks are
+    # allowed, and only the chunks' in-order concatenation is the history.
+    #
+    # The verdict nevertheless matches the in-memory entry points for that
+    # concatenation field for field, because every physical line is rebuilt
+    # and handed to the same strict decoder and the same tenant/seq/prev/hash
+    # checks in the same physical order:
+    #   * physical lines are bounded by exactly one character, the byte 0x0A
+    #     (LF); a trailing CR stays attached to its line the way _split_lf
+    #     keeps it, and the empty segment after a final LF is not an extra
+    #     line (empty buffer at end() yields nothing);
+    #   * a line's bytes are UTF-8 decoded only once its LF arrives (or at
+    #     end() for the final LF-less tail), so a multibyte sequence split
+    #     across chunks is rebuilt before decoding while the first illegal
+    #     byte is reported on its own physical line -- one plus the number of
+    #     LFs already processed -- the same bad_line _decode_lines locates;
+    #   * a completed line is parsed the instant its LF arrives, so the first
+    #     defective line stops the scan and the streaming entry points never
+    #     pull another chunk; a valid history is consumed to the end.
+    #
+    # all_tenants=False runs verify_bytes' single-tenant scan (records of
+    # other canonical identities interleave freely and are skipped) and a
+    # defect is kept as (reason, at), "at" being the expected seq or the
+    # physical line exactly as _verify_snapshot fills it. all_tenants=True
+    # runs verify_all_bytes' physical-order scan over every tenant and keeps
+    # (reason, line, tenant, state_seq): line/tenant/reason back the
+    # verify_all/heads failure object and state_seq fills the AuditChainStateError
+    # seq exactly the way _scan_all_chains fills it for manifest_bytes
+    # (None/None on a line that cannot name a tenant; the record's own seq
+    # when present as a plain int on a missing-field line, else the expected
+    # seq). The running byte count and whole-stream sha256 back manifest.
+    def __init__(self, chain, all_tenants, tenant=None):
+        self._chain = chain
+        self._all_tenants = all_tenants
+        # Single-tenant mode state.
+        self._key = chain._tenant_key(tenant) if not all_tenants else None
+        self._expected = 1
+        self._prev = ZERO
+        self.count = 0
+        # All-tenant state: serialized key -> [expected_seq, prev_hash, count]
+        # and (original_tenant, state) in first-appearance order.
+        self._states = {}
+        self._order = []
+        # Stream mechanics: pending bytes after the last processed LF, the
+        # completed physical-line count, total consumed bytes, the whole-input
+        # digest and the first defect reported (None while valid).
+        self._buffer = b""
+        self._line_no = 0
+        self._byte_length = 0
+        self._hasher = hashlib.sha256()
+        self._defect = None
+
+    @property
+    def byte_length(self):
+        return self._byte_length
+
+    def feed(self, chunk):
+        # Fold one bytes chunk into the running stream and validate every
+        # physical line it completes. Returns the first defect tuple (kept for
+        # end()) or None while the history stays valid. Bytes are accounted
+        # for before line validation, which only matters for a successful
+        # manifest (a defect discards the counters anyway).
+        if self._defect is not None:
+            return self._defect
+        self._byte_length += len(chunk)
+        self._hasher.update(chunk)
+        self._buffer += chunk
+        while True:
+            idx = self._buffer.find(b"\n")
+            if idx < 0:
+                return None
+            line_bytes = self._buffer[:idx]
+            self._buffer = self._buffer[idx + 1:]
+            self._line_no += 1
+            defect = self._check_line(line_bytes)
+            if defect is not None:
+                self._defect = defect
+                return defect
+
+    def end(self):
+        # Finalize the stream: the bytes still pending after the last LF are
+        # the final physical line (a history need not end with LF). Returns
+        # the first defect tuple or None for a fully valid history.
+        if self._defect is not None:
+            return self._defect
+        if self._buffer:
+            self._line_no += 1
+            defect = self._check_line(self._buffer)
+            self._buffer = b""
+            if defect is not None:
+                self._defect = defect
+        return self._defect
+
+    def _check_line(self, line_bytes):
+        # Validate one complete physical line. Strict UTF-8 decoding happens
+        # here on the line's exact bytes (a split multibyte sequence has been
+        # rebuilt by feed), then strict standard JSON; neither underlying
+        # exception ever escapes. The first undecodable/unparseable line is a
+        # missing-class defect with no determinable tenant.
+        try:
+            raw = line_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._bad_line()
+        try:
+            item = _strict_loads(raw)
+        except Exception:
+            return self._bad_line()
+        if self._all_tenants:
+            return self._check_all_item(item)
+        return self._check_tenant_item(item)
+
+    def _bad_line(self):
+        if self._all_tenants:
+            return ("missing", self._line_no, None, None)
+        return ("missing", self._line_no)
+
+    def _check_tenant_item(self, item):
+        # Single-tenant scan, line for line the rules _scan applies: foreign
+        # canonical identities are skipped, a target record's fields/seq/
+        # prev/hash are checked from (1, ZERO), and a missing-field defect
+        # carries the record's own seq when it is a plain int so _verify_snapshot
+        # reports that seq, else the physical line.
+        if not isinstance(item, dict) or "tenant" not in item:
+            return ("missing", self._line_no)
+        if self._chain._tenant_key(item["tenant"]) != self._key:
+            return None
+        if any(k not in item for k in FIELDS):
+            seq = item.get("seq")
+            at = seq if isinstance(seq, int) and not isinstance(seq, bool) \
+                else self._line_no
+            return ("missing", at)
+        seq = item["seq"]
+        if isinstance(seq, bool) or not isinstance(seq, int) \
+                or seq != self._expected:
+            return ("sequence", self._expected)
+        if item["prev"] != self._prev:
+            return ("digest", self._expected)
+        if item["hash"] != self._chain._hash(item):
+            return ("digest", self._expected)
+        self.count += 1
+        self._prev = item["hash"]
+        self._expected += 1
+        return None
+
+    def _check_all_item(self, item):
+        # Every-tenant physical-order scan, line for line the rules
+        # _verify_all_snapshot and _scan_all_chains share. The state is looked
+        # up before the field check, so a missing-field line fills the
+        # manifest state error's seq with its own plain-int seq or the
+        # expected one, exactly _scan_all_chains' rule; the verify_all/heads
+        # failure object instead reports the physical line as "at".
+        if not isinstance(item, dict) or "tenant" not in item:
+            return ("missing", self._line_no, None, None)
+        tenant = item["tenant"]
+        key = self._chain._tenant_key(tenant)
+        state = self._states.get(key)
+        if state is None:
+            state = [1, ZERO, 0]
+            self._states[key] = state
+            self._order.append((tenant, state))
+        expected, _prev, _count = state
+        if any(k not in item for k in FIELDS):
+            seq = item.get("seq")
+            state_seq = seq if isinstance(seq, int) \
+                and not isinstance(seq, bool) else expected
+            return ("missing", self._line_no, tenant, state_seq)
+        seq = item["seq"]
+        if isinstance(seq, bool) or not isinstance(seq, int) \
+                or seq != expected:
+            return ("sequence", self._line_no, tenant, expected)
+        if item["prev"] != state[1]:
+            return ("digest", self._line_no, tenant, expected)
+        if item["hash"] != self._chain._hash(item):
+            return ("digest", self._line_no, tenant, expected)
+        state[0] += 1
+        state[1] = item["hash"]
+        state[2] += 1
+        return None
+
+    def verify_all_result(self, with_hash=False):
+        # Project the successful scan into verify_all_bytes' result shape
+        # (with_hash=True adds each tenant's verified tail hash for heads).
+        tenants = []
+        for tenant, state in self._order:
+            entry = {"tenant": tenant, "count": state[2]}
+            if with_hash:
+                entry["hash"] = state[1]
+            tenants.append(entry)
+        return {"ok": True, "tenants": tenants}
+
+    def manifest_result(self):
+        # Project the successful stream into the version-1 manifest: the
+        # byte length and sha256 describe the exact concatenated input bytes
+        # and tenants follow physical first-appearance order with original
+        # tenant value, verified count and last-record hash.
+        return {
+            "version": MANIFEST_VERSION,
+            "byte_length": self._byte_length,
+            "byte_sha256": self._hasher.hexdigest(),
+            "tenants": [
+                {"tenant": tenant, "count": state[2], "hash": state[1]}
+                for tenant, state in self._order
+            ],
+        }
+
+
 class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
@@ -2655,6 +2867,43 @@ class AuditChain:
             parts.append(chunk)
         return b"".join(parts)
 
+    @staticmethod
+    def _chunk_iterator(chunks):
+        # The streaming entries' container boundary, the same shape
+        # _join_chunks enforces for the non-streaming chunk entries: the
+        # caller must already have ruled out a bare bytes/bytearray object
+        # (whose iteration would yield ints); a non-iterable container is
+        # rejected here as ValueError. Element types are checked lazily by the
+        # caller while pulling, so the first non-bytes member ends
+        # consumption at once without reading the path (there is no path).
+        try:
+            return iter(chunks)
+        except TypeError:
+            raise ValueError(
+                "chunks must be an iterable of bytes, got "
+                f"{type(chunks).__name__}"
+            ) from None
+
+    @staticmethod
+    def _drive_stream(scan, iterator):
+        # Pull a single-consumption chunk iterator through an incremental
+        # _StreamScan: each member must be bytes (bytearray and every other
+        # type are ValueError -- the first bad member ends consumption and no
+        # later member is ever pulled), and the first defective completed
+        # line stops the pull as well, so later chunks are never requested.
+        # On clean exhaustion the trailing (possibly LF-less) final line is
+        # finalized via end(). Returns the scan, whose defect property carries
+        # the first verdict (None for a fully valid history).
+        for chunk in iterator:
+            if not isinstance(chunk, bytes):
+                raise ValueError(
+                    f"each chunk must be bytes, got {type(chunk).__name__}"
+                )
+            if scan.feed(chunk) is not None:
+                return scan
+        scan.end()
+        return scan
+
     def verify_chunks(self, chunks, tenant, expected_count=None):
         # Chunked offline counterpart of verify_bytes for large histories:
         # the caller hands over the JSONL history as an iterable of bytes
@@ -2730,6 +2979,127 @@ class AuditChain:
         return self._verify_all_snapshot(
             self._join_chunks(chunks), with_hash=True
         )
+
+    def verify_stream(self, chunks, tenant, expected_count=None):
+        # Single-consumption streaming counterpart of verify_bytes: the JSONL
+        # history arrives as an ordered iterable of bytes chunks and is
+        # validated one chunk at a time, so the caller never has to assemble
+        # the full bytes. Chunks may be cut at any byte boundary
+        # (mid-UTF-8-sequence, mid-JSON-object or mid-LF) and empty chunks are
+        # allowed; only the chunks' in-order single concatenation is the
+        # history. The iterator is pulled exactly once and only forward, this
+        # entry never reads, creates or modifies the path this AuditChain
+        # points at, never touches the network, keeps no cache or on-disk
+        # index and never mutates a chunk; an empty iterable (or only empty
+        # chunks) is a successful empty history.
+        #
+        # The boundary crosses before any chunk is read, in the exact order
+        # verify_bytes/verify_chunks use: the chunk container must not itself
+        # be a bytes or bytearray (its iteration would yield ints), the tenant
+        # crosses the same standard-JSON boundary as append/verify, and
+        # expected_count must be None or a non-negative plain int (bool
+        # rejected even though it subclasses int); a non-iterable container or
+        # a non-bytes (bytearray included) member is ValueError, the first bad
+        # member ending consumption at once. The stream then runs the same
+        # strict UTF-8, LF/CRLF physical-line, standard-JSON (duplicate keys
+        # and non-standard numbers rejected), canonical-tenant-identity, seq,
+        # prev and hash rules verify_bytes runs, rebuilding physical lines
+        # across chunk boundaries, so the success result
+        # ({"ok": True, "count": n}) and the first failure
+        # ({"ok": False, "at", "reason"}) are field-for-field verify_bytes'
+        # verdict on the same concatenated bytes -- "at" is the expected seq
+        # for a sequence/digest/shortage defect and the physical line for a
+        # missing-class defect, and expected_count shortage/overage is
+        # missing/sequence exactly as verify_bytes reports it. The first parse,
+        # field, order or digest defect stops the pull immediately (later
+        # chunks are never requested); a valid history is consumed to the end.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        _validate_json_value(tenant)
+        _validate_expected_count(expected_count)
+        scan = self._drive_stream(
+            _StreamScan(self, all_tenants=False, tenant=tenant),
+            self._chunk_iterator(chunks),
+        )
+        if scan._defect is not None:
+            reason, at = scan._defect
+            return {"ok": False, "at": at, "reason": reason}
+        count = scan.count
+        if expected_count is not None:
+            if count < expected_count:
+                return {"ok": False, "at": count + 1, "reason": "missing"}
+            if count > expected_count:
+                return {"ok": False, "at": expected_count + 1,
+                        "reason": "sequence"}
+        return {"ok": True, "count": count}
+
+    def verify_all_stream(self, chunks):
+        # Single-consumption streaming counterpart of verify_all_bytes: every
+        # tenant chain is validated over the ordered bytes chunks without
+        # assembling the full snapshot. The chunk boundary, single-pass
+        # consumption and offline purity are exactly verify_stream's: a bare
+        # bytes/bytearray object, a non-iterable container or a non-bytes
+        # (bytearray included) member are ValueError, the first bad member
+        # ending consumption at once; empty chunks and empty iterables are the
+        # successful empty history ({"ok": True, "tenants": []}). Physical
+        # lines are rebuilt across arbitrary UTF-8/JSON/LF chunk cuts and run
+        # through verify_all_bytes' exact strict rules and per-tenant
+        # (1, ZERO)-anchored chain checks, so success carries the same tenant
+        # first-appearance order, original tenant values and counts, and the
+        # first failure is verify_all_bytes' exact object
+        # ({"ok": False, "at": physical line, "tenant", "reason"}), tenant
+        # None when the line cannot name one and reason missing/sequence/
+        # digest. The first defect stops the pull and no partial tenant list
+        # is returned; a valid history is consumed to the end.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        scan = self._drive_stream(
+            _StreamScan(self, all_tenants=True),
+            self._chunk_iterator(chunks),
+        )
+        if scan._defect is not None:
+            reason, at, tenant, _state_seq = scan._defect
+            return {"ok": False, "at": at, "tenant": tenant, "reason": reason}
+        return scan.verify_all_result()
+
+    def heads_stream(self, chunks):
+        # Single-consumption streaming counterpart of heads_bytes: the
+        # caller supplies the JSONL snapshot whose chain-head directory is
+        # wanted as ordered bytes chunks and never assembles the full bytes.
+        # Everything verify_all_stream does applies identically -- same chunk
+        # boundary (bare bytes/bytearray, non-iterable container and non-bytes
+        # members are ValueError, first bad member ends consumption), same
+        # strict UTF-8/LF/CRLF/standard-JSON/identity/seq/prev/hash rules with
+        # lines rebuilt across chunk boundaries, same first-defect object
+        # ({"ok": False, "at", "tenant", "reason"}) and no partial tenant
+        # list, and a valid history is consumed to the end -- and on success
+        # the result is heads_bytes' exact shape:
+        # {"ok": True, "tenants": [...]} in physical first-appearance order,
+        # each entry carrying the original tenant, its verified count and its
+        # tail hash -- the (expected_count, expected_hash) pair an offline
+        # conditional append needs (empty history gives []). Like the other
+        # streaming entries this consumes the iterator exactly once, never
+        # reads, creates or modifies the configured path and never touches the
+        # network.
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        scan = self._drive_stream(
+            _StreamScan(self, all_tenants=True),
+            self._chunk_iterator(chunks),
+        )
+        if scan._defect is not None:
+            reason, at, tenant, _state_seq = scan._defect
+            return {"ok": False, "at": at, "tenant": tenant, "reason": reason}
+        return scan.verify_all_result(with_hash=True)
 
     def _verify_heads_snapshot(self, data, assertions):
         # Core of verify_heads over an exact in-memory snapshot. Touches no
@@ -2979,6 +3349,54 @@ class AuditChain:
         # snapshot raises AuditChainStateError with the same fields as
         # manifest_bytes, never a partial manifest.
         return self._manifest_snapshot(self._join_chunks(chunks))
+
+    def manifest_stream(self, chunks):
+        # Single-consumption streaming counterpart of manifest_bytes: the
+        # JSONL snapshot arrives as ordered bytes chunks and is validated and
+        # summarized in one forward pass, so the caller never has to assemble
+        # the full bytes. Chunks may be cut at any byte boundary
+        # (mid-UTF-8-sequence, mid-JSON-object or mid-LF) and empty chunks are
+        # allowed; only their in-order single concatenation is the snapshot.
+        # The iterator is consumed exactly once, this entry never reads,
+        # creates or modifies the configured path, never touches the network
+        # and keeps no cache or on-disk index; an empty iterable (or only
+        # empty chunks) is the legitimate empty snapshot and yields the empty
+        # version-1 manifest (length 0, sha256 of the empty bytes, no
+        # tenants).
+        #
+        # The chunk container boundary is exactly verify_all_stream's: a bare
+        # bytes or bytearray object is not a chunk container, a non-iterable
+        # container or a non-bytes (bytearray included) member is ValueError,
+        # and the first bad member ends consumption at once -- all before a
+        # defect verdict. The whole stream is validated with the exact strict
+        # UTF-8, LF/CRLF physical-line, standard-JSON (duplicate keys and
+        # non-standard numbers rejected), canonical-tenant-identity, seq, prev
+        # and hash rules manifest_bytes uses, with physical lines rebuilt
+        # across chunk boundaries; a corrupt stream never yields a partial
+        # manifest but raises AuditChainStateError with the exact
+        # tenant/seq/reason/line manifest_bytes fills (reason only
+        # missing/sequence/digest; a line that cannot name a tenant has
+        # tenant/seq None; no underlying UnicodeDecodeError or JSON exception
+        # is ever surfaced) and the pull stops at the first defective line.
+        # Only after the complete input verifies is the version-1 manifest
+        # returned: byte_length and byte_sha256 describe the exact original
+        # concatenated bytes, and tenants matches manifest_bytes' order and
+        # fields (physical first-appearance, original tenant value, verified
+        # count, last record's hash).
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        scan = self._drive_stream(
+            _StreamScan(self, all_tenants=True),
+            self._chunk_iterator(chunks),
+        )
+        if scan._defect is not None:
+            reason, line, tenant, state_seq = scan._defect
+            raise AuditChainStateError(
+                tenant, state_seq, reason, line) from None
+        return scan.manifest_result()
 
     def _verify_manifest_snapshot(self, data, manifest):
         # Core of verify_manifest over an exact in-memory snapshot. Touches
