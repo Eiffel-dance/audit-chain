@@ -1213,6 +1213,171 @@ class AuditChain:
             tenants.append(entry)
         return {"ok": True, "tenants": tenants}
 
+    def _parse_all_snapshot(self, data):
+        # Parse an already-verified in-memory snapshot into per-tenant records
+        # without touching any path. The bytes are assumed to have passed
+        # _verify_all_snapshot(data, with_hash=True), so every physical line is
+        # strict standard JSON and the chains are internally consistent; the
+        # parsing here never re-validates. Returns a dict mapping the serialized
+        # canonical tenant key to [tenant_value, records_in_seq_order], inserted
+        # in first-appearance order (so iteration preserves it); the tenant
+        # value keeps its original first-appearance spelling and each record
+        # keeps its parsed five-field values verbatim. Logical equality between
+        # two snapshots is then plain Python value equality on these records,
+        # aligned by canonical key and seq.
+        lines, _bad_line = self._decode_lines(data)
+        chains = {}
+        for raw in lines:
+            item = _strict_loads(raw)
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            chain = chains.get(key)
+            if chain is None:
+                chain = [tenant, []]
+                chains[key] = chain
+            chain[1].append(item)
+        return chains
+
+    def compare_bytes(self, left_data, right_data):
+        # Pure in-memory reconciliation of two independent backup snapshots:
+        # it consumes only the two given bytes buffers, never reads, creates or
+        # modifies the path this AuditChain points at, never touches the
+        # network and never mutates either buffer. The snapshots may interleave
+        # the same tenants in different physical orders: comparison aligns
+        # records by canonical JSON tenant identity (the same identity append/
+        # verify_all use) and per-tenant seq, so interleaving order is never a
+        # difference and a tenant's reported value is the first one that names
+        # it on each side.
+        #
+        # The type boundary crosses first, before either snapshot is parsed:
+        # each argument must be exactly bytes -- bytearray, str and every other
+        # type are rejected with ValueError immediately, so a non-bytes value
+        # can never reach the decoder. Both buffers then run the exact
+        # verify_all_bytes rules (strict UTF-8, LF-only physical lines,
+        # standard JSON with duplicate keys and non-standard numbers rejected,
+        # field set, canonical tenant identity, per-tenant seq, prev and hash).
+        # A corrupt snapshot is not compared: the result reports that side with
+        # verify_all_bytes' exact failure fields and "side" naming it, and when
+        # both are corrupt the left side is always reported first. Empty
+        # snapshots equal one another and a tenant absent from a side is its
+        # empty chain.
+        #
+        # Once both are valid, tenants are compared in left first-appearance
+        # order followed by tenants appearing only on the right, each chain
+        # record by record from seq 1 on the logical values. Full agreement
+        # returns {"ok": True, "equal": True, "tenants": [...]} with one entry
+        # per tenant (original tenant, count and tail hash) in that order. The
+        # first difference returns
+        # {"ok": True, "equal": False, "tenant", "seq", "reason", "left",
+        # "right"}: a record present on both sides but differing in event, prev
+        # or hash is "different" (both records attached); a chain longer on
+        # either side reports the first absent record as "missing_left" or
+        # "missing_right" with the existing record attached and the missing
+        # side None. Exactly one position -- the first the ordering selects --
+        # is reported, never a cascade of follow-on differences.
+        if not isinstance(left_data, bytes):
+            raise ValueError(
+                "left_data must be bytes, got "
+                f"{type(left_data).__name__}"
+            )
+        if not isinstance(right_data, bytes):
+            raise ValueError(
+                "right_data must be bytes, got "
+                f"{type(right_data).__name__}"
+            )
+        left_heads = self._verify_all_snapshot(left_data, with_hash=True)
+        if not left_heads["ok"]:
+            return {
+                "ok": False,
+                "side": "left",
+                "at": left_heads["at"],
+                "tenant": left_heads["tenant"],
+                "reason": left_heads["reason"],
+            }
+        right_heads = self._verify_all_snapshot(right_data, with_hash=True)
+        if not right_heads["ok"]:
+            return {
+                "ok": False,
+                "side": "right",
+                "at": right_heads["at"],
+                "tenant": right_heads["tenant"],
+                "reason": right_heads["reason"],
+            }
+        left_chains = self._parse_all_snapshot(left_data)
+        right_chains = self._parse_all_snapshot(right_data)
+        # Tenant comparison order: the left side's first-appearance order, then
+        # any tenant only the right side names (in its first-appearance order).
+        order = list(left_chains)
+        for key in right_chains:
+            if key not in left_chains:
+                order.append(key)
+        for key in order:
+            left_chain = left_chains.get(key)
+            right_chain = right_chains.get(key)
+            left_records = left_chain[1] if left_chain is not None else []
+            right_records = right_chain[1] if right_chain is not None else []
+            # The tenant value reported for a difference is the first one that
+            # names this canonical identity, preferring the left side because
+            # the ordering starts there.
+            if left_chain is not None:
+                tenant = left_chain[0]
+            else:
+                tenant = right_chain[0]
+            shared = min(len(left_records), len(right_records))
+            for i in range(shared):
+                left_item = left_records[i]
+                right_item = right_records[i]
+                # Records aligned by canonical tenant identity and seq: only
+                # event, prev and hash can differ logically, and any one of
+                # them makes the position "different".
+                if left_item["event"] != right_item["event"] \
+                        or left_item["prev"] != right_item["prev"] \
+                        or left_item["hash"] != right_item["hash"]:
+                    return {
+                        "ok": True,
+                        "equal": False,
+                        "tenant": tenant,
+                        "seq": i + 1,
+                        "reason": "different",
+                        "left": left_item,
+                        "right": right_item,
+                    }
+            if len(left_records) > len(right_records):
+                return {
+                    "ok": True,
+                    "equal": False,
+                    "tenant": tenant,
+                    "seq": shared + 1,
+                    "reason": "missing_right",
+                    "left": left_records[shared],
+                    "right": None,
+                }
+            if len(right_records) > len(left_records):
+                return {
+                    "ok": True,
+                    "equal": False,
+                    "tenant": tenant,
+                    "seq": shared + 1,
+                    "reason": "missing_left",
+                    "left": None,
+                    "right": right_records[shared],
+                }
+        # Every aligned chain agrees record for record. The summary follows the
+        # comparison order above, carrying each tenant's original value, count
+        # and tail hash from the side that first names it.
+        tenants = []
+        for key in order:
+            chain = left_chains.get(key)
+            if chain is None:
+                chain = right_chains[key]
+            records = chain[1]
+            tenants.append({
+                "tenant": chain[0],
+                "count": len(records),
+                "hash": records[-1]["hash"] if records else ZERO,
+            })
+        return {"ok": True, "equal": True, "tenants": tenants}
+
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
         # physical line order. Each tenant gets an independent expected seq and
