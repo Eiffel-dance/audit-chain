@@ -1493,20 +1493,14 @@ class AuditChain:
         _validate_json_value(tenant)
         return self._export_tenant_bytes(tenant)
 
-    def export_tenant_range(self, tenant, start_seq, end_seq=None):
-        # Segmented offline migration export: the closed interval
-        # [start_seq, end_seq] of one tenant's verified chain, so an archive
-        # or restore can continue from a known chain head. Returns UTF-8
-        # bytes only: like export_tenant it never creates, mutates or deletes
-        # any path and never touches the network.
-        #
-        # Every input crosses its boundary before a single byte is read: the
-        # tenant uses the same standard-JSON rule as append/verify/export,
-        # start_seq must be a positive plain int (bool is rejected even
-        # though it subclasses int; floats and other types are too), and
-        # end_seq must be None (open tail) or a plain int not smaller than
-        # start_seq. A rejected call raises ValueError without reading or
-        # creating anything, under any contention.
+    @staticmethod
+    def _validate_range_bounds(tenant, start_seq, end_seq):
+        # Shared input boundary of export_tenant_range and its chunked
+        # counterpart: the tenant crosses the same standard-JSON rule as
+        # append/verify/export, start_seq must be a positive plain int (bool
+        # is rejected even though it subclasses int; floats and other types
+        # are too), and end_seq must be None (open tail) or a plain int not
+        # smaller than start_seq.
         _validate_json_value(tenant)
         if isinstance(start_seq, bool) or not isinstance(start_seq, int) \
                 or start_seq < 1:
@@ -1521,6 +1515,29 @@ class AuditChain:
                 "end_seq must be None or an integer not smaller than "
                 f"start_seq, got {end_seq!r}"
             )
+
+    def export_tenant_range(self, tenant, start_seq, end_seq=None):
+        # Segmented offline migration export: the closed interval
+        # [start_seq, end_seq] of one tenant's verified chain, so an archive
+        # or restore can continue from a known chain head. Returns UTF-8
+        # bytes only: like export_tenant it never creates, mutates or deletes
+        # any path and never touches the network.
+        #
+        # Every input crosses its boundary before a single byte is read: the
+        # tenant uses the same standard-JSON rule as append/verify/export,
+        # start_seq must be a positive plain int (bool is rejected even
+        # though it subclasses int; floats and other types are too), and
+        # end_seq must be None (open tail) or a plain int not smaller than
+        # start_seq. A rejected call raises ValueError without reading or
+        # creating anything, under any contention.
+        self._validate_range_bounds(tenant, start_seq, end_seq)
+        return self._export_tenant_range_bytes(tenant, start_seq, end_seq)
+
+    def _export_tenant_range_bytes(self, tenant, start_seq, end_seq):
+        # Shared body of export_tenant_range and the chunked range exporter:
+        # the caller has already validated tenant/start_seq/end_seq with
+        # _validate_range_bounds.
+        #
         # One shared-lease snapshot, exactly as verify/export_tenant use: the
         # segment is cut from the full state wholly before or wholly after
         # any concurrent append, never a torn read. The tenant's complete
@@ -1665,6 +1682,43 @@ class AuditChain:
         # empty log is a legitimate empty export and yields no chunks.
         self._validate_chunk_size(chunk_size)
         data = self.export_all()
+        return self._iter_fixed_chunks(data, chunk_size)
+
+    def export_tenant_range_chunks(self, tenant, start_seq, end_seq=None,
+                                   chunk_size=None):
+        # Chunked segmented offline migration export for large tenant
+        # histories: the large-history counterpart of export_tenant_range.
+        # Returns an iterator of bytes chunks whose concatenation is
+        # byte-for-byte exactly what export_tenant_range(tenant, start_seq,
+        # end_seq) returns for the same snapshot; the iterator itself is the
+        # result, so callers stream the segment instead of holding one
+        # contiguous copy. Chunks are cut on plain byte offsets and may split
+        # a UTF-8 sequence, a JSON object or a newline. Like
+        # export_tenant_range this never creates, mutates or deletes any path
+        # and never touches the network.
+        #
+        # Every input crosses its boundary before the chunk iterator is
+        # produced or any history is read, in the exact order export_tenant_range
+        # uses followed by chunk_size: the tenant uses the same standard-JSON
+        # rule as append/verify/export, start_seq must be a positive plain
+        # int and end_seq None or a plain int not smaller than start_seq
+        # (bool rejected even though it subclasses int; floats and other
+        # types are too), and chunk_size must be a positive plain int (bool,
+        # floats, strings, zero and negatives rejected). An illegal call
+        # raises ValueError immediately rather than from a half-consumed
+        # iterator, without reading or creating anything.
+        self._validate_range_bounds(tenant, start_seq, end_seq)
+        self._validate_chunk_size(chunk_size)
+        # The whole export is fixed to one complete snapshot: the full chain
+        # verification and the range checks -- the exact scan and interval
+        # rules export_tenant_range runs -- complete over one shared-lease
+        # snapshot before the first chunk is yielded, so a corrupt source
+        # raises AuditChainStateError (same tenant/seq/reason/line as
+        # export_tenant_range) and an unsatisfiable interval raises
+        # AuditChainRangeError (tenant, start_seq, end_seq and the verified
+        # count) instead of yielding a partial prefix, and a concurrent
+        # append can never land between chunks.
+        data = self._export_tenant_range_bytes(tenant, start_seq, end_seq)
         return self._iter_fixed_chunks(data, chunk_size)
 
     def import_tenant(self, tenant, data):
@@ -1987,6 +2041,51 @@ class AuditChain:
         data = self._join_chunks(chunks)
         return self.import_all(data)
 
+    @staticmethod
+    def _validate_import_range_heads(expected_heads):
+        # Shared expected_heads boundary of import_all_range and its chunked
+        # counterpart: expected_heads must be a list whose members are
+        # objects carrying exactly the keys tenant, expected_count and
+        # expected_hash; the tenant crosses the standard-JSON boundary,
+        # expected_count must be a non-negative plain int (bool rejected even
+        # though it subclasses int; floats, strings and other types are too)
+        # and expected_hash must be exactly the 64 lowercase hex characters
+        # of a sha256 digest (an empty target chain is asserted with ZERO); a
+        # canonical JSON tenant identity may appear at most once. Returns the
+        # assertions as (tenant, expected_count, expected_hash) tuples in
+        # list order, the tenant value kept verbatim.
+        if not isinstance(expected_heads, list):
+            raise ValueError(
+                "expected_heads must be a list, got "
+                f"{type(expected_heads).__name__}"
+            )
+        assertions = []
+        seen = set()
+        for head in expected_heads:
+            if not isinstance(head, dict) or set(head) != {
+                "tenant", "expected_count", "expected_hash"
+            }:
+                raise ValueError(
+                    "each expected head must be an object containing exactly "
+                    "the keys 'tenant', 'expected_count' and "
+                    f"'expected_hash', got {head!r}"
+                )
+            tenant = head["tenant"]
+            expected_count = head["expected_count"]
+            expected_hash = head["expected_hash"]
+            _validate_json_value(tenant)
+            _validate_required_count(expected_count)
+            _validate_expected_hash(expected_hash)
+            key = AuditChain._tenant_key(tenant)
+            if key in seen:
+                raise ValueError(
+                    "duplicate tenant head assertion (same canonical JSON "
+                    f"identity): {tenant!r}"
+                )
+            seen.add(key)
+            assertions.append((tenant, expected_count, expected_hash))
+        return assertions
+
     def import_all_range(self, data, expected_heads):
         # Multi-tenant segmented offline migration: the cross-tenant
         # counterpart of import_tenant_range. Several tenants' JSONL segments
@@ -2015,36 +2114,7 @@ class AuditChain:
         # and no byte changes; the assertions themselves are not evaluated.
         if not isinstance(data, bytes):
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
-        if not isinstance(expected_heads, list):
-            raise ValueError(
-                "expected_heads must be a list, got "
-                f"{type(expected_heads).__name__}"
-            )
-        assertions = []
-        seen = set()
-        for head in expected_heads:
-            if not isinstance(head, dict) or set(head) != {
-                "tenant", "expected_count", "expected_hash"
-            }:
-                raise ValueError(
-                    "each expected head must be an object containing exactly "
-                    "the keys 'tenant', 'expected_count' and "
-                    f"'expected_hash', got {head!r}"
-                )
-            tenant = head["tenant"]
-            expected_count = head["expected_count"]
-            expected_hash = head["expected_hash"]
-            _validate_json_value(tenant)
-            _validate_required_count(expected_count)
-            _validate_expected_hash(expected_hash)
-            key = self._tenant_key(tenant)
-            if key in seen:
-                raise ValueError(
-                    "duplicate tenant head assertion (same canonical JSON "
-                    f"identity): {tenant!r}"
-                )
-            seen.add(key)
-            assertions.append((tenant, expected_count, expected_hash))
+        assertions = self._validate_import_range_heads(expected_heads)
         if not data:
             return []
         # The complete input is verified in memory, before the target is ever
@@ -2137,6 +2207,92 @@ class AuditChain:
             prefix = b"" if (not target or target.endswith(b"\n")) else b"\n"
             f.write(prefix + "".join(chunks).encode("utf-8"))
             return records
+
+    def import_tenant_range_chunks(self, tenant, chunks, expected_count,
+                                   expected_hash):
+        # Chunked segmented offline counterpart of import_tenant_range for
+        # large tenant histories: the caller streams a single-tenant chain
+        # segment (typically produced by export_tenant_range_chunks) as an
+        # ordered iterable of bytes chunks instead of one contiguous buffer.
+        # Chunks may be cut at any byte boundary -- mid-UTF-8-sequence,
+        # mid-line or mid-record -- and empty chunks are allowed; only their
+        # in-order concatenation is the segment. Records keep their original
+        # tenant/seq/event/prev/hash values verbatim -- nothing is renumbered
+        # or recomputed.
+        #
+        # Boundary first, exactly as import_tenant_range orders it: the
+        # tenant crosses the standard-JSON boundary, expected_count must be a
+        # non-negative plain int (bool rejected even though it subclasses
+        # int; floats, strings and other types are too) and expected_hash
+        # must be exactly the 64 lowercase hex characters of a sha256 digest
+        # (an empty target chain is asserted with ZERO) -- all validated
+        # before a single chunk is consumed. chunks must be an iterable of
+        # bytes: a bare bytes or bytearray object is not a chunk container
+        # (its iteration would yield ints), a non-iterable container or a
+        # non-bytes element are all ValueError, a bad element ending
+        # consumption at once -- all before any lease is taken, any history
+        # is read or the path is probed. The complete input is joined and
+        # verified before the target is touched, so field-for-field this
+        # accepts exactly the complete contents import_tenant_range accepts
+        # and raises exactly what import_tenant_range raises: chain defects
+        # are AuditChainStateError (reason missing/sequence/digest, with
+        # tenant, seq and the input's physical line), a record of another
+        # canonical tenant identity is ValueError, a mismatching target head
+        # is AuditChainConflictError carrying both heads, and input problems
+        # take strict priority over target state. An empty concatenation is a
+        # no-op after validation returning [], creating and reading nothing.
+        # On success the whole segment lands as one indivisible commit and
+        # the parsed records are returned in physical order, identical
+        # objects to what import_tenant_range returns for the same bytes; no
+        # failure path writes a single partial byte, and shared-lease readers
+        # observe only the complete pre-commit or post-commit state.
+        _validate_json_value(tenant)
+        _validate_required_count(expected_count)
+        _validate_expected_hash(expected_hash)
+        data = self._join_chunks(chunks)
+        return self.import_tenant_range(
+            tenant, data, expected_count, expected_hash
+        )
+
+    def import_all_range_chunks(self, chunks, expected_heads):
+        # Chunked multi-tenant segmented offline counterpart of
+        # import_all_range for large histories: the caller streams several
+        # tenants' interleaved JSONL segments (typically produced by
+        # export_tenant_range_chunks calls against a source log) as an
+        # ordered iterable of bytes chunks. Chunks may be cut at any byte
+        # boundary -- mid-UTF-8-sequence, mid-line or mid-record -- and empty
+        # chunks are allowed; only their in-order concatenation is the
+        # stream. Records keep their original values verbatim.
+        #
+        # Boundary first, exactly as import_all_range orders it:
+        # expected_heads must satisfy the exact boundary import_all_range
+        # documents (a list of objects carrying exactly the keys tenant,
+        # expected_count and expected_hash; standard-JSON tenant;
+        # non-negative plain int count, bool rejected; 64 lowercase hex hash;
+        # no duplicate canonical tenant identity) and is validated before a
+        # single chunk is consumed. chunks must be an iterable of bytes: a
+        # bare bytes or bytearray object is not a chunk container, a
+        # non-iterable container or a non-bytes element are all ValueError, a
+        # bad element ending consumption at once -- all before any lease is
+        # taken, any history is read or the path is probed. The complete
+        # input is joined and verified in memory before the target is
+        # touched, so field-for-field this accepts exactly the complete
+        # contents import_all_range accepts and raises exactly what
+        # import_all_range raises: malformed lines, fields, sequences and
+        # digests are AuditChainStateError located by tenant, seq and the
+        # input's physical line, a record of a canonical tenant identity no
+        # assertion lists is ValueError, a mismatching target head is
+        # AuditChainConflictError in expected_heads order, and input problems
+        # take strict priority over target state. An empty concatenation is a
+        # no-op after validation returning [], creating and reading nothing.
+        # On success the whole stream lands as one indivisible block and the
+        # parsed records are returned in physical order, identical objects to
+        # what import_all_range returns for the same bytes; no failure path
+        # writes a single partial byte, and shared-lease readers observe only
+        # the complete pre-commit or post-commit state.
+        self._validate_import_range_heads(expected_heads)
+        data = self._join_chunks(chunks)
+        return self.import_all_range(data, expected_heads)
 
     def read_tenant(self, tenant, start_seq=1, page_size=None):
         # Read-only, single-tenant paged view. Returns plain record dicts
