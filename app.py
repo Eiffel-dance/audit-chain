@@ -1494,6 +1494,43 @@ class AuditChain:
         right_data = self._join_chunks(right_chunks)
         return self.compare_bytes(left_data, right_data)
 
+    def compare(self, other):
+        # Path-oriented read-only reconciliation: the entry point
+        # compare_bytes/compare_chunks leave to the caller -- it reads each
+        # side's whole JSONL log itself and returns the complete two-state
+        # verdict. other must be exactly another AuditChain instance; that
+        # boundary crosses before either path is read or even probed, so a
+        # non-AuditChain value raises ValueError without touching any byte.
+        if not isinstance(other, AuditChain):
+            raise ValueError(
+                "other must be an AuditChain instance, got "
+                f"{type(other).__name__}"
+            )
+        # Each side takes one shared-lease snapshot, so every byte compared is
+        # a full JSONL state wholly before or wholly after some append -- a
+        # half line or a cross-append splice can never reach the comparison.
+        # The snapshots are captured before either is verified, so two chains
+        # on the same path (the same instance, or two instances built from the
+        # same path) reuse one identical snapshot and compare as stably equal
+        # to themselves; a missing file is its legitimate empty history (b"")
+        # and is not created.
+        same_path = other is self or other.path == self.path
+        left_data = self._read_snapshot()
+        right_data = left_data if same_path else other._read_snapshot()
+        # From here the call is exactly compare_bytes over those two captured
+        # buffers: both run verify_all_bytes' full rules first (strict UTF-8,
+        # LF physical lines, standard JSON, canonical tenant identity,
+        # per-tenant seq, prev and hash), a corrupt side is not compared and is
+        # reported as "left"/"right" with its first physical line, tenant and
+        # missing/sequence/digest reason, left fixed first when both are
+        # corrupt, and only then are records aligned by canonical tenant and
+        # seq with the existing different/missing_left/missing_right/equality
+        # semantics. Concurrent appends change nothing: the verdict is
+        # field-for-field compare_bytes(left_snapshot, right_snapshot). This
+        # entry creates, rewrites or deletes nothing, writes no manifest,
+        # cache or side data, and never touches the network.
+        return self.compare_bytes(left_data, right_data)
+
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
         # physical line order. Each tenant gets an independent expected seq and
