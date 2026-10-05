@@ -1494,6 +1494,64 @@ class AuditChain:
         right_data = self._join_chunks(right_chunks)
         return self.compare_bytes(left_data, right_data)
 
+    def compare(self, other):
+        # Path-oriented read-only counterpart of compare_bytes: each side is
+        # the complete on-disk JSONL state an AuditChain points at, so a caller
+        # reconciling two log paths never has to read either file itself. other
+        # must be exactly another AuditChain instance -- the type boundary
+        # crosses first, before either path is opened, so a value of any other
+        # type raises ValueError without a single byte being read, the same
+        # boundary-first ordering every other compare entry point uses.
+        #
+        # Each side contributes exactly one snapshot: a _read_snapshot shared-
+        # lease read of the complete file, which -- just like verify_all/heads
+        # -- is always the full state wholly before or wholly after some
+        # append, never a half line or a span across two appends. A missing
+        # path is the legitimate pre-append view and contributes empty bytes,
+        # which compare_bytes treats as an empty history. When both instances
+        # name the same path the two sides must describe one shared state:
+        # the snapshot is read exactly once and handed to both sides, so the
+        # result is stable self-equality (and no second window exists in which
+        # a concurrent append could make a log differ from itself). Distinct
+        # paths are read independently; a concurrent append only chooses which
+        # complete pre/post-append snapshot each side happens to observe.
+        #
+        # The two buffers are then handed verbatim to compare_bytes, so the
+        # result is field-for-field exactly
+        # compare_bytes(left_snapshot, right_snapshot): both snapshots first
+        # run the full verify_all_bytes rules (strict UTF-8, LF-only physical
+        # lines, standard JSON, field set, canonical JSON tenant identity,
+        # per-tenant seq, prev and hash), a corrupt side is never compared and
+        # is reported as {"ok": False, "side": "left"/"right", "at",
+        # "tenant", "reason"} with the first physical line, its tenant and the
+        # missing/sequence/digest reason; when both are corrupt the left side
+        # is always reported first. Only then are records aligned by canonical
+        # tenant identity and per-tenant seq regardless of physical
+        # interleaving, preserving compare_bytes' original-tenant value,
+        # first-difference, different/missing_left/missing_right and full
+        # equality summary semantics.
+        #
+        # This entry is strictly read-only: it never creates, rewrites or
+        # deletes either path, writes no manifest, cache or other side data,
+        # and never touches the network; a corrupt log is reported, never
+        # repaired. Existing append, import/export, read, verify, heads,
+        # manifest, compare_bytes and compare_chunks behavior is untouched.
+        if not isinstance(other, AuditChain):
+            raise ValueError(
+                "other must be an AuditChain instance, got "
+                f"{type(other).__name__}"
+            )
+        if other.path == self.path:
+            # Same log on both sides: one complete snapshot serves both, so
+            # the two inputs can never come from two different append windows
+            # and self-comparison is deterministically equal.
+            data = self._read_snapshot()
+            left_data, right_data = data, data
+        else:
+            left_data = self._read_snapshot()
+            right_data = other._read_snapshot()
+        return self.compare_bytes(left_data, right_data)
+
     def verify_all(self):
         # Validate every tenant chain in one read-only pass over the file, in
         # physical line order. Each tenant gets an independent expected seq and
