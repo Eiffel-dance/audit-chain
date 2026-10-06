@@ -114,6 +114,42 @@ def _validate_expected_hash(expected_hash):
         )
 
 
+def _validate_tenant_range_verify(tenant, start_seq, end_seq, expected_prev):
+    # Shared input boundary of verify_tenant_range_bytes and
+    # verify_tenant_range_chunks: a detached single-tenant chain segment is
+    # checked against a declared interval and the predecessor digest it must
+    # continue, all before a single snapshot byte is read or a single chunk
+    # pulled. The tenant crosses the same standard-JSON boundary as
+    # append/verify/export; start_seq must be a positive plain int (bool is
+    # rejected even though it subclasses int; floats and other types are
+    # too); end_seq must be None (open tail) or a plain int not smaller than
+    # start_seq; and expected_prev must be exactly the 64 lowercase hex
+    # characters of a sha256 digest, reusing _validate_expected_hash. A
+    # segment beginning a chain (start_seq 1) can only continue the empty
+    # predecessor, so expected_prev must then be exactly ZERO. Every failure
+    # here is a caller error and ends as ValueError before content parsing.
+    _validate_json_value(tenant)
+    if isinstance(start_seq, bool) or not isinstance(start_seq, int) \
+            or start_seq < 1:
+        raise ValueError(
+            f"start_seq must be a positive integer, got {start_seq!r}"
+        )
+    if end_seq is not None and (
+        isinstance(end_seq, bool) or not isinstance(end_seq, int)
+        or end_seq < start_seq
+    ):
+        raise ValueError(
+            "end_seq must be None or an integer not smaller than "
+            f"start_seq, got {end_seq!r}"
+        )
+    _validate_expected_hash(expected_prev)
+    if start_seq == 1 and expected_prev != ZERO:
+        raise ValueError(
+            "expected_prev must be ZERO when start_seq is 1, got "
+            f"{expected_prev!r}"
+        )
+
+
 def _validate_expected_heads(expected_heads):
     # expected_heads is an ordered list of compact head expectations, one per
     # canonical JSON tenant identity; list order is the conflict-priority
@@ -526,6 +562,173 @@ class _StreamScan:
                 {"tenant": tenant, "count": state[2], "hash": state[1]}
                 for tenant, state in self._order
             ],
+        }
+
+
+class _TenantRangeScan:
+    # Internal incremental engine behind verify_tenant_range_chunks, and the
+    # single validation body both the bytes and chunked offline range entries
+    # delegate to: a segment is validated as a detached migration fragment --
+    # the chain tail it continues is named by expected_prev, never by the
+    # target log -- so no AuditChain path is ever probed. Every physical line
+    # must be a record of the one declared canonical JSON tenant identity
+    # carrying exactly the five FIELDS keys; seqs must run start_seq,
+    # start_seq+1, ... with the first prev equal to expected_prev, and each
+    # hash is recomputed with the existing algorithm. The mechanics are
+    # _StreamScan's exactly: bytes accumulate behind LF-only physical-line
+    # boundaries, strict UTF-8 decoding waits for the completed line, chunks
+    # may be cut at any UTF-8/JSON/LF position, and the first defective
+    # completed line stops feed so the caller never pulls another chunk.
+    #
+    # The first verdict is kept in _defect as a dict shaped exactly like the
+    # public failure result ({ok: False, reason, at, tenant, start_seq,
+    # end_seq}); a record of another canonical tenant identity violates the
+    # single-tenant segment contract and is raised as _ForeignTenant (surfaced
+    # as ValueError), the same rule the import scans use, and wins by
+    # physical line order over a later chain defect. After all lines, an empty
+    # segment or a declared end_seq the records stop short of is the missing
+    # verdict "declared range missing its tail".
+    def __init__(self, chain, tenant, start_seq, end_seq, expected_prev):
+        self._chain = chain
+        self.tenant = tenant
+        self.start_seq = start_seq
+        self.end_seq = end_seq
+        self._key = chain._tenant_key(tenant)
+        self._expected = start_seq
+        self._prev = expected_prev
+        self.count = 0
+        self._buffer = b""
+        self._line_no = 0
+        self._defect = None
+
+    def feed(self, chunk):
+        # Fold one bytes chunk into the running segment and validate every
+        # physical line it completes, exactly the _StreamScan loop: a
+        # completed line is checked the instant its LF arrives, so the first
+        # defective line ends the scan and a chunked caller never requests
+        # another chunk. Returns the kept verdict dict or None while valid.
+        if self._defect is not None:
+            return self._defect
+        self._buffer += chunk
+        while True:
+            idx = self._buffer.find(b"\n")
+            if idx < 0:
+                return None
+            line_bytes = self._buffer[:idx]
+            self._buffer = self._buffer[idx + 1:]
+            self._line_no += 1
+            try:
+                self._check_line(line_bytes)
+            except _ForeignTenant:
+                raise
+            if self._defect is not None:
+                return self._defect
+
+    def end(self):
+        # Finalize the segment: the bytes pending after the last LF are the
+        # final physical line (a segment need not end with LF), then the
+        # declared interval must be covered exactly. Returns the kept verdict
+        # dict or None when the segment fully verifies.
+        if self._defect is not None:
+            return self._defect
+        if self._buffer:
+            self._line_no += 1
+            pending, self._buffer = self._buffer, b""
+            self._check_line(pending)
+            if self._defect is not None:
+                return self._defect
+        if self.count == 0:
+            self._defect = self._fail("missing", self.start_seq)
+            return self._defect
+        if self.end_seq is not None and self._expected <= self.end_seq:
+            # Records ran out before the declared closed interval: the first
+            # seq the segment owes but does not contain locates the missing
+            # tail.
+            self._defect = self._fail("missing", self._expected)
+            return self._defect
+        return None
+
+    def _fail(self, reason, at):
+        return {
+            "ok": False,
+            "reason": reason,
+            "at": at,
+            "tenant": self.tenant,
+            "start_seq": self.start_seq,
+            "end_seq": self.end_seq,
+        }
+
+    def _check_line(self, line_bytes):
+        # Validate one complete physical line with the exact strict rules the
+        # import-range scan uses: strict UTF-8 then strict standard JSON
+        # (duplicate keys and non-standard numbers rejected), a single object
+        # of the declared canonical tenant identity carrying exactly the five
+        # FIELDS keys, the expected JSON-integer seq, the predecessor digest
+        # and a recomputed current hash. The first problem in physical order
+        # decides and fills "at" the same way _scan_import_range's _Broken
+        # does: the record's own plain-int seq for a missing-field line when
+        # it carries one, else the expected seq; parse/object failures carry
+        # the physical line number.
+        try:
+            raw = line_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self._defect = self._fail("missing", self._line_no)
+            return
+        try:
+            item = _strict_loads(raw)
+        except Exception:
+            self._defect = self._fail("missing", self._line_no)
+            return
+        if not isinstance(item, dict) or "tenant" not in item:
+            self._defect = self._fail("missing", self._line_no)
+            return
+        if self._chain._tenant_key(item["tenant"]) != self._key:
+            raise _ForeignTenant(self._line_no)
+        if set(item) != set(FIELDS):
+            seq = item.get("seq")
+            at = seq if isinstance(seq, int) and not isinstance(seq, bool) \
+                else self._expected
+            self._defect = self._fail("missing", at)
+            return
+        seq = item["seq"]
+        # A declared closed interval must be covered exactly: once the
+        # record for end_seq has verified, any further physical line sits
+        # past the interval the fragment was declared to be and is a
+        # sequence defect located at the first seq beyond it.
+        if self.end_seq is not None and self._expected > self.end_seq:
+            self._defect = self._fail("sequence", self._expected)
+            return
+        # Same strict JSON-integer seq rule as every other scan: a float
+        # spelling (1.0, 1e0), bool, string, null, array/object or a
+        # mismatching integer is a sequence defect, never renumbered.
+        if isinstance(seq, bool) or not isinstance(seq, int) \
+                or seq != self._expected:
+            self._defect = self._fail("sequence", self._expected)
+            return
+        if item["prev"] != self._prev:
+            self._defect = self._fail("digest", self._expected)
+            return
+        if item["hash"] != self._chain._hash(item):
+            self._defect = self._fail("digest", self._expected)
+            return
+        self.count += 1
+        self._prev = item["hash"]
+        self._expected += 1
+
+    def result(self):
+        # Project a fully verified segment into the public success shape:
+        # start/end echo the declared interval (an open tail closes at the
+        # actual last seq), count is the record count and hash the last
+        # record's digest -- exactly the head assertion a subsequent
+        # import_tenant_range call needs.
+        return {
+            "ok": True,
+            "tenant": self.tenant,
+            "start_seq": self.start_seq,
+            "end_seq": (self.end_seq if self.end_seq is not None
+                        else self.start_seq + self.count - 1),
+            "count": self.count,
+            "hash": self._prev,
         }
 
 
@@ -2993,6 +3196,126 @@ class AuditChain:
         if not isinstance(data, bytes):
             raise ValueError(f"data must be bytes, got {type(data).__name__}")
         return self._verify_all_snapshot(data, with_hash=True)
+
+    def _finish_tenant_range_scan(self, scan, data):
+        # Shared bytes body of verify_tenant_range_bytes and the joined-input
+        # path: drive the whole buffer through the detached-segment scan and
+        # project its first verdict. A record of another canonical tenant
+        # identity violates the single-tenant segment contract and surfaces
+        # as ValueError, exactly the import scans' rule.
+        try:
+            scan.feed(data)
+            scan.end()
+        except _ForeignTenant as ft:
+            raise ValueError(
+                f"range data must contain only tenant {scan.tenant!r}; "
+                f"a record of another tenant appears at line {ft.line}"
+            ) from None
+        if scan._defect is not None:
+            return scan._defect
+        return scan.result()
+
+    def verify_tenant_range_bytes(self, data, tenant, start_seq,
+                                  end_seq=None, expected_prev=None):
+        # Pure in-memory, read-only offline check of a single-tenant interval
+        # cut from a backup: prove which predecessor summary the detached
+        # fragment continues without ever touching the target log. The caller
+        # supplies the JSONL bytes, the declared canonical JSON tenant, the
+        # closed interval [start_seq, end_seq] (end_seq None for an open
+        # tail) and the predecessor digest the first record's prev must
+        # equal; this entry never reads, creates or modifies the path this
+        # AuditChain points at, never touches the network and writes no
+        # cache. data must be exactly bytes; the tenant crosses the same
+        # standard-JSON boundary as append/verify; start_seq must be a
+        # positive plain int (bool rejected even though it subclasses int),
+        # end_seq None or a plain int not smaller than start_seq, and
+        # expected_prev exactly 64 lowercase hex characters -- a segment
+        # beginning a chain (start_seq 1) accepts only ZERO. Every boundary
+        # failure is ValueError raised before a single byte is parsed, so it
+        # takes strict priority over every content verdict, and no path is
+        # probed.
+        #
+        # The whole boundary crossed, the bytes are treated as a migration
+        # fragment detached from their original file: strict UTF-8/LF
+        # physical lines, standard JSON (duplicate keys and non-standard
+        # numbers rejected), every line an object of the one declared tenant
+        # carrying exactly the five FIELDS keys, seqs running start_seq,
+        # start_seq+1, ... from the asserted prev, each current hash
+        # recomputed with the existing algorithm. An empty fragment, an
+        # unparseable/undeclarable line or a declared interval whose tail is
+        # missing (records stop before end_seq, or end_seq is given and the
+        # fragment ends early) returns reason "missing"; a wrong seq --
+        # including a record past a declared end_seq, since the interval
+        # must be covered exactly -- returns "sequence"; a wrong prev or
+        # hash returns "digest". A record of
+        # another canonical tenant identity is ValueError. Failure carries
+        # at, tenant and the interval locators start_seq/end_seq; success
+        # returns {ok, tenant, start_seq, end_seq, count, hash} with the
+        # actual last seq and tail hash (an open tail closes at the real
+        # end), usable directly as import_tenant_range's head assertion.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        _validate_tenant_range_verify(
+            tenant, start_seq, end_seq, expected_prev)
+        scan = _TenantRangeScan(
+            self, tenant, start_seq, end_seq, expected_prev)
+        return self._finish_tenant_range_scan(scan, data)
+
+    def verify_tenant_range_chunks(self, chunks, tenant, start_seq,
+                                   end_seq=None, expected_prev=None):
+        # Chunked offline counterpart of verify_tenant_range_bytes: the
+        # detached single-tenant interval arrives as an ordered iterable of
+        # bytes chunks instead of one contiguous buffer, so the receiver
+        # checks a streamed backup fragment without assembling it. Chunks may
+        # be cut at any byte boundary -- a UTF-8 sequence, a JSON object or
+        # an LF -- and empty chunks are allowed; only their in-order
+        # concatenation is the segment, so for the same concatenation this
+        # result is field-for-field exactly what
+        # verify_tenant_range_bytes returns. The iterator is pulled exactly
+        # once and only forward; like the bytes entry this never reads,
+        # creates or modifies the configured path, never touches the network
+        # and writes no cache.
+        #
+        # The full parameter boundary crosses exactly as
+        # verify_tenant_range_bytes orders it (standard-JSON tenant,
+        # positive plain int start_seq, None/not-smaller end_seq, 64
+        # lowercase hex expected_prev with ZERO mandatory at start_seq 1),
+        # before the chunk container is even iterated. The container
+        # boundary is exactly verify_all_chunks'/heads_chunks': a bare bytes
+        # or bytearray object is not a chunk container, a non-iterable
+        # container or a non-bytes (bytearray included) member are
+        # ValueError, and the first bad member ends consumption at once. The
+        # first defective completed line -- a missing/sequence/digest
+        # verdict or a foreign-tenant ValueError -- likewise stops the pull,
+        # so later chunks are never requested. Verdicts and the success
+        # shape are the bytes entry's exactly.
+        _validate_tenant_range_verify(
+            tenant, start_seq, end_seq, expected_prev)
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        iterator = self._chunk_iterator(chunks)
+        scan = _TenantRangeScan(
+            self, tenant, start_seq, end_seq, expected_prev)
+        try:
+            for chunk in iterator:
+                if not isinstance(chunk, bytes):
+                    raise ValueError(
+                        f"each chunk must be bytes, got {type(chunk).__name__}"
+                    )
+                if scan.feed(chunk) is not None:
+                    return scan._defect
+            scan.end()
+        except _ForeignTenant as ft:
+            raise ValueError(
+                f"range data must contain only tenant {tenant!r}; "
+                f"a record of another tenant appears at line {ft.line}"
+            ) from None
+        if scan._defect is not None:
+            return scan._defect
+        return scan.result()
 
     @staticmethod
     def _join_chunks(chunks):
