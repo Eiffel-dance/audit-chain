@@ -3494,7 +3494,17 @@ class AuditChain:
         result = self._verify_all_snapshot(data, with_hash=True)
         if not result["ok"]:
             return result
-        actual = self._manifest_snapshot(data)
+        return self._compare_manifest(manifest, self._manifest_snapshot(data))
+
+    def _compare_manifest(self, manifest, actual):
+        # Fixed first-difference manifest comparison shared by
+        # _verify_manifest_snapshot (actual derived from exact in-memory
+        # bytes) and verify_manifest_stream (actual derived from the
+        # incremental stream), so every entry reports the identical verdict
+        # for the same snapshot. manifest has already crossed
+        # _validate_manifest and actual is a fully verified version-1
+        # manifest of the same snapshot.
+        #
         # The byte-level fields come first, in one fixed order: the total
         # length then the sha256 of the exact bytes. Their mismatches need
         # no locator beyond expected/actual.
@@ -3686,3 +3696,67 @@ class AuditChain:
         return self._verify_manifest_snapshot(
             self._join_chunks(chunks), manifest
         )
+
+    def verify_manifest_stream(self, chunks, manifest):
+        # Single-consumption streaming counterpart of
+        # verify_manifest_bytes/verify_manifest_chunks: the JSONL snapshot
+        # arrives as an ordered iterable of bytes chunks and is validated
+        # and summarized in one forward pass, so the receiver never has to
+        # materialize the whole snapshot to check it against a carried
+        # version-1 manifest. Chunks may be cut at any byte boundary
+        # (mid-UTF-8-sequence, mid-JSON-object or mid-LF) and empty chunks
+        # are allowed; only their in-order single concatenation is the
+        # snapshot. The iterator is pulled exactly once and only forward,
+        # this entry never reads, creates or modifies the path this
+        # AuditChain points at, never touches the network, keeps no cache
+        # or on-disk index and never mutates a chunk; an empty iterable (or
+        # only empty chunks) is the legitimate empty snapshot.
+        #
+        # The manifest boundary is exactly verify_manifest's boundary and
+        # crosses before any chunk is requested (mirroring
+        # verify_manifest_chunks), so a malformed manifest -- wrong shape,
+        # version, length, digest, tenant directory or a duplicate
+        # canonical JSON tenant -- raises ValueError without pulling a
+        # single chunk. The chunk container boundary is exactly
+        # verify_all_stream's/manifest_stream's: a bare bytes or bytearray
+        # object is not a chunk container, a non-iterable container or a
+        # non-bytes (bytearray included) member is ValueError, and the
+        # first bad member ends consumption at once. The stream then runs
+        # the same strict UTF-8, LF/CRLF physical-line, standard-JSON
+        # (duplicate keys and non-standard numbers rejected),
+        # canonical-tenant-identity, seq, prev and hash rules
+        # verify_all_bytes runs, rebuilding physical lines across chunk
+        # boundaries, while byte_length and byte_sha256 accumulate over the
+        # exact original concatenated bytes.
+        #
+        # Chain integrity first, exactly as verify_manifest_bytes orders
+        # it: the first defective completed line stops the pull immediately
+        # (later chunks are never requested) and returns verify_all_bytes'
+        # exact failure object -- {"ok": False, "at", "tenant", "reason"}
+        # with reason only missing/sequence/digest and tenant None when the
+        # line cannot name one -- with no manifest field compared. Only a
+        # fully self-consistent stream reaches the manifest comparison,
+        # which is _verify_manifest_snapshot's fixed first-difference order
+        # over the manifest derived from the stream: byte_length,
+        # byte_sha256, tenant_order (index locator), then per tenant in
+        # manifest order tenant_count and tenant_hash (tenant locator),
+        # first difference only, with expected/actual. Full agreement
+        # returns {"ok": True, "manifest": ...} echoing the manifest
+        # actually computed from the stream, so the result is
+        # field-for-field what verify_manifest_bytes and
+        # verify_manifest_chunks return for the same concatenated bytes.
+        manifest = _validate_manifest(manifest)
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        scan = self._drive_stream(
+            _StreamScan(self, all_tenants=True),
+            self._chunk_iterator(chunks),
+        )
+        if scan._defect is not None:
+            reason, at, tenant, _state_seq = scan._defect
+            return {"ok": False, "at": at, "tenant": tenant,
+                    "reason": reason}
+        return self._compare_manifest(manifest, scan.manifest_result())
