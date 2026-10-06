@@ -3881,6 +3881,79 @@ class AuditChain:
                 tenant, state_seq, reason, line) from None
         return scan.manifest_result()
 
+    def compact(self):
+        # Offline log compaction: rewrite the JSONL history in the canonical
+        # serialization append uses, eliminating format redundancy (CRLF line
+        # endings, non-canonical whitespace and key order, non-shortest
+        # number spellings) without changing any tenant chain's meaning.
+        # Takes no business events, so no input boundary applies.
+        #
+        # The whole read-validate-rewrite runs inside one exclusive
+        # data-file lease (the same _write_lease append uses), so a
+        # concurrent append serializes wholly before or after the
+        # compaction and a shared-lease reader or verifier only ever
+        # observes the complete pre- or post-compaction snapshot, never a
+        # partially rewritten file. A missing path is a legitimate empty
+        # history: the empty version-1 manifest is returned and no file (or
+        # parent directory) is created; an empty file is the same empty
+        # history and is left byte-for-byte untouched.
+        #
+        # Before any byte is rewritten, the complete snapshot is validated
+        # with the strict rules verify_all/export_all/manifest share --
+        # strict UTF-8, LF-only physical lines with a trailing CR accepted
+        # as line-ending whitespace, standard JSON with duplicate keys and
+        # non-standard numbers rejected, canonical tenant identity, each
+        # tenant's seq from 1 and prev from ZERO, recomputed hashes -- plus
+        # the exact five-field record contract import_all enforces: a record
+        # carrying extra keys cannot be rewritten with its five fields
+        # preserved exactly, so it is a missing-class defect exactly as
+        # _scan_all_chains(exact_fields=True) reports it. The first defect
+        # in physical line order raises AuditChainStateError with
+        # tenant/seq/reason/line filled exactly the way export_all and
+        # manifest fill them (reason only missing/sequence/digest; a line
+        # that cannot name a tenant reports tenant/seq None), and the
+        # original file is left untouched -- no partial replacement is ever
+        # produced.
+        #
+        # Only a fully valid history is rewritten: every record is
+        # re-emitted with append's exact serialization (sort_keys=True,
+        # allow_nan=False, one LF per record), preserving every tenant's
+        # physical interleave order and the five field values verbatim, so
+        # record hashes, tenant heads and the manifest tenant directory are
+        # unchanged and a repeated compact is a fixed point. The file is
+        # truncated and rewritten in place under the lease -- never swapped
+        # for a sidecar file -- and the version-1 manifest of the new
+        # snapshot is returned, its byte_length and byte_sha256 computed
+        # over the rewritten bytes. No network, no remote anchoring, no
+        # extra on-disk format.
+        if not self.path.exists():
+            # A missing path is the empty history; unlike the write lease,
+            # this probe creates neither the file nor its parent directory.
+            return self._manifest_snapshot(b"")
+        with self._write_lease() as f:
+            data = f.read()
+            if not data:
+                # An empty file is the empty history and stays untouched.
+                return self._manifest_snapshot(b"")
+            lines, bad_line = self._decode_lines(data)
+            records = self._scan_all_chains(lines, bad_line, exact_fields=True)
+            new_data = b"".join(
+                (json.dumps(item, sort_keys=True, allow_nan=False) + "\n")
+                .encode("utf-8")
+                for item in records
+            )
+            if new_data != data:
+                # In-place truncate-and-rewrite under the exclusive lease:
+                # the flock serializes this against appends and readers on
+                # the same inode, which a rename-and-replace could not (an
+                # append holding the old description would land on an
+                # unlinked file). Skipped entirely when the history was
+                # already canonical, so a repeated compact touches no byte.
+                f.seek(0)
+                f.truncate()
+                f.write(new_data)
+            return self._manifest_snapshot(new_data)
+
     def _verify_manifest_snapshot(self, data, manifest):
         # Core of verify_manifest over an exact in-memory snapshot. Touches
         # no path: the caller owns how the bytes were obtained, so the same
