@@ -3881,6 +3881,90 @@ class AuditChain:
                 tenant, state_seq, reason, line) from None
         return scan.manifest_result()
 
+    def compact(self):
+        # Offline whole-log compaction: rewrite the JSONL history in the
+        # canonical append serialization, eliminating format redundancy
+        # (CRLF line endings, a missing final LF, non-canonical key order or
+        # number spellings, extra whitespace) without changing any tenant
+        # chain's meaning. Takes no arguments and accepts no business
+        # events; the five record fields (tenant, seq, event, prev, hash)
+        # and the physical interleaving order of all tenants' records are
+        # carried over verbatim, so record digests, tenant heads, the
+        # manifest tenant directory and every existing entry point's
+        # behaviour are exactly the same before and after.
+        #
+        # The whole read-validate-rewrite runs inside one exclusive lease:
+        # the directory lease covers the existence probe (a not-yet-existing
+        # log is a legitimate empty history and yields the empty version-1
+        # manifest without creating the path, indivisibly against any
+        # concurrent creation), then the data-file exclusive lease covers
+        # the consistent snapshot, the validation and the in-place
+        # replacement. Lock order is always directory-then-data, the same as
+        # _head_lease, so this cannot deadlock against a plain append, and
+        # competing appends, readers and verifiers only ever observe the
+        # complete pre-compact or the complete post-compact snapshot, never
+        # a partially rewritten file.
+        with self._dir_lease():
+            try:
+                f = open(self.path, "r+b")
+            except FileNotFoundError:
+                # Definitive empty history: no writer can create the path
+                # while the directory lease is held. Return the empty
+                # version-1 manifest and create nothing.
+                return self._manifest_snapshot(b"")
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                data = f.read()
+                if not data:
+                    # An existing empty file is the same empty history:
+                    # nothing to rewrite, no byte changes, empty manifest.
+                    return self._manifest_snapshot(b"")
+                lines, bad_line = self._decode_lines(data)
+                # The complete history must verify before anything is
+                # replaced, with the exact strict rules export_all applies
+                # plus import_all's exact-field contract (a record must
+                # carry exactly the five FIELDS keys: an extra key would not
+                # survive canonical re-serialization, so it is a
+                # missing-class defect here). The first defective physical
+                # line raises AuditChainStateError with tenant/seq/reason/
+                # line filled exactly the way export_all fills them (reason
+                # only missing/sequence/digest; a line that cannot name a
+                # tenant reports tenant/seq None), and the original file is
+                # left untouched -- no partial replacement is ever visible.
+                records = self._scan_all_chains(lines, bad_line,
+                                                exact_fields=True)
+                # Re-emit every record in physical order with the exact
+                # serialization append uses (sort_keys=True,
+                # allow_nan=False, one LF per record, single LF at the end),
+                # keeping each record's five field values verbatim.
+                new_data = b"".join(
+                    (json.dumps(item, sort_keys=True, allow_nan=False)
+                     + "\n").encode("utf-8")
+                    for item in records
+                )
+                if new_data != data:
+                    # In-place replacement under the exclusive lease: the
+                    # truncate-and-rewrite is indivisible to every
+                    # lock-cooperating reader and writer, and a snapshot
+                    # already in canonical form is left byte-identical
+                    # without a write. No temp file, sidecar index, network
+                    # call or remote anchor is involved.
+                    f.seek(0)
+                    f.truncate(0)
+                    f.write(new_data)
+                    f.flush()
+                # The returned version-1 manifest describes the new
+                # snapshot: byte_length and byte_sha256 are computed over
+                # the rewritten bytes, while the tenant directory (physical
+                # first-appearance order, original tenant values, verified
+                # counts and last-record hashes) is unchanged from the
+                # pre-compact manifest.
+                return self._manifest_snapshot(new_data)
+            finally:
+                # Closing the description also releases the flock.
+                f.close()
+
     def _verify_manifest_snapshot(self, data, manifest):
         # Core of verify_manifest over an exact in-memory snapshot. Touches
         # no path: the caller owns how the bytes were obtained, so the same
