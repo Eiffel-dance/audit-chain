@@ -1240,6 +1240,87 @@ class AuditChain:
                 f, tenant, events, expected_count, expected_hash
             )
 
+    @staticmethod
+    def _validate_many_entry(entry):
+        # One member of a cross-tenant append group, checked at the input
+        # boundary shared by append_many and append_many_stream: it must be
+        # an object carrying exactly the keys 'tenant' and 'event', and both
+        # values cross the same standard-JSON boundary as append (non-string
+        # object keys, cyclic containers, non-finite numbers and values
+        # without a standard JSON encoding are ValueError). Returns the
+        # (tenant, event) pair with the original values verbatim.
+        if not isinstance(entry, dict) or set(entry) != {"tenant", "event"}:
+            raise ValueError(
+                "each entry must be an object containing exactly the "
+                f"keys 'tenant' and 'event', got {entry!r}"
+            )
+        tenant, event = entry["tenant"], entry["event"]
+        _validate_json_value(tenant)
+        _validate_json_value(event)
+        return tenant, event
+
+    def _append_many_locked(self, f, norm):
+        # Scan, build and append on a description already holding the
+        # exclusive data-file lease. Shared verbatim by append_many and
+        # append_many_stream, so a list and a single-consumption iterable
+        # carrying the same entries over the same history always produce the
+        # same records and the exact same JSONL bytes. norm is the fully
+        # validated entry list as (tenant, event) tuples in input order.
+        data = f.read()
+        lines, bad_line = self._decode_lines(data)
+        # Each involved tenant gets the exact full-chain scan append
+        # runs (seqs 1..n from a ZERO prev, each digest recomputed);
+        # foreign records interleave freely. A defect is recorded, not
+        # raised immediately: when several affected chains are broken,
+        # the first physical line in the log decides the result, and an
+        # equal line is broken by input order.
+        heads = {}   # serialized tenant -> [count, prev]
+        broken = []  # (line, first_input_index, AuditChainStateError)
+        for idx, (tenant, _event) in enumerate(norm):
+            key = self._tenant_key(tenant)
+            if key in heads:
+                continue
+            try:
+                count, prev = self._scan(tenant, lines, bad_line)
+            except _Broken as b:
+                seq = b.at if b.at is not None else b.expect
+                broken.append((
+                    b.line, idx,
+                    AuditChainStateError(tenant, seq, b.reason, b.line),
+                ))
+            else:
+                heads[key] = [count, prev]
+        if broken:
+            raise min(broken, key=lambda x: (x[0], x[1]))[2] from None
+        # Every affected pre-state is valid. Build the records in input
+        # order; a tenant appearing several times gets contiguous seq
+        # numbering for its occurrences, each record linking to the
+        # previous one (on disk or earlier in this group), using the
+        # identical fields, seq numbering, prev digest and hash rule as
+        # append.
+        items = []
+        chunks = []
+        progress = {key: [count, prev] for key, (count, prev) in heads.items()}
+        for tenant, event in norm:
+            key = self._tenant_key(tenant)
+            count, prev = progress[key]
+            item = {"tenant": tenant, "seq": count + 1,
+                    "event": event, "prev": prev}
+            item["hash"] = self._hash(item)
+            items.append(item)
+            chunks.append(
+                json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            )
+            progress[key] = [count + 1, item["hash"]]
+        # One O_APPEND write places the whole group atomically at the
+        # current end of file; under the exclusive lease no other writer
+        # moves that end, and no existing byte can be overwritten. The
+        # physical JSONL order is the input order, while other tenants'
+        # legitimate interleaved records already on disk stay in place.
+        prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
+        f.write(prefix + "".join(chunks).encode("utf-8"))
+        return items
+
     def append_many(self, entries):
         # Cross-tenant atomic append. entries must be a list of objects whose
         # key set is exactly {"tenant", "event"}; list order is the write
@@ -1255,15 +1336,7 @@ class AuditChain:
             )
         norm = []
         for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"tenant", "event"}:
-                raise ValueError(
-                    "each entry must be an object containing exactly the "
-                    f"keys 'tenant' and 'event', got {entry!r}"
-                )
-            tenant, event = entry["tenant"], entry["event"]
-            _validate_json_value(tenant)
-            _validate_json_value(event)
-            norm.append((tenant, event))
+            norm.append(self._validate_many_entry(entry))
         if not norm:
             return []
         with self._write_lease() as f:
@@ -1272,61 +1345,73 @@ class AuditChain:
             # group commits as one indivisible byte interval: competing
             # writers serialize wholly before or after it and shared-lease
             # readers observe either the complete pre-commit or the complete
-            # post-commit state, never a partial group.
-            data = f.read()
-            lines, bad_line = self._decode_lines(data)
-            # Each involved tenant gets the exact full-chain scan append
-            # runs (seqs 1..n from a ZERO prev, each digest recomputed);
-            # foreign records interleave freely. A defect is recorded, not
-            # raised immediately: when several affected chains are broken,
-            # the first physical line in the log decides the result, and an
-            # equal line is broken by input order.
-            heads = {}   # serialized tenant -> [count, prev]
-            broken = []  # (line, first_input_index, AuditChainStateError)
-            for idx, (tenant, _event) in enumerate(norm):
-                key = self._tenant_key(tenant)
-                if key in heads:
-                    continue
-                try:
-                    count, prev = self._scan(tenant, lines, bad_line)
-                except _Broken as b:
-                    seq = b.at if b.at is not None else b.expect
-                    broken.append((
-                        b.line, idx,
-                        AuditChainStateError(tenant, seq, b.reason, b.line),
-                    ))
-                else:
-                    heads[key] = [count, prev]
-            if broken:
-                raise min(broken, key=lambda x: (x[0], x[1]))[2] from None
-            # Every affected pre-state is valid. Build the records in input
-            # order; a tenant appearing several times gets contiguous seq
-            # numbering for its occurrences, each record linking to the
-            # previous one (on disk or earlier in this group), using the
-            # identical fields, seq numbering, prev digest and hash rule as
-            # append.
-            items = []
-            chunks = []
-            progress = {key: [count, prev] for key, (count, prev) in heads.items()}
-            for tenant, event in norm:
-                key = self._tenant_key(tenant)
-                count, prev = progress[key]
-                item = {"tenant": tenant, "seq": count + 1,
-                        "event": event, "prev": prev}
-                item["hash"] = self._hash(item)
-                items.append(item)
-                chunks.append(
-                    json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
-                )
-                progress[key] = [count + 1, item["hash"]]
-            # One O_APPEND write places the whole group atomically at the
-            # current end of file; under the exclusive lease no other writer
-            # moves that end, and no existing byte can be overwritten. The
-            # physical JSONL order is the input order, while other tenants'
-            # legitimate interleaved records already on disk stay in place.
-            prefix = b"" if (not data or data.endswith(b"\n")) else b"\n"
-            f.write(prefix + "".join(chunks).encode("utf-8"))
-            return items
+            # post-commit state, never a partial group. The locked body is
+            # shared with append_many_stream, which is why the two entries'
+            # committed bytes are identical for the same entries over the
+            # same history.
+            return self._append_many_locked(f, norm)
+
+    def append_many_stream(self, entries):
+        # Streaming counterpart of append_many: the cross-tenant entries
+        # arrive as a one-shot iterable consumed exactly once, in production
+        # order, instead of a materialized list. A bare bytes, bytearray or
+        # str is not an entry container (iterating it would yield ints or
+        # characters), a bare dict is one entry object rather than a group of
+        # them, and a non-iterable value is not a group either; all are
+        # caller errors and raise ValueError. Every produced entry must be an
+        # object carrying exactly the keys 'tenant' and 'event', and every
+        # tenant and event crosses the same standard-JSON boundary as
+        # append/append_many (non-string object keys, cyclic containers,
+        # non-finite numbers and values without a standard JSON encoding are
+        # ValueError). The container shape and the whole stream -- every
+        # produced entry included -- are all validated before a lease is
+        # taken, a path is probed or a single history byte is read, so no
+        # malformed call can depend on contention or history state, and the
+        # first invalid member stops the consumption immediately: nothing
+        # further is pulled and no consumed prefix is written. An exception
+        # the iterator raises before it finishes propagates verbatim (it is
+        # not wrapped in ValueError) and, like every other pre-lease failure,
+        # writes nothing. An empty iterator is a no-op returning []: no file
+        # is created, no history is read and no byte changes.
+        if isinstance(entries, (bytes, bytearray, str, dict)):
+            raise ValueError(
+                "entries must be an iterable of entries, got a single "
+                f"{type(entries).__name__} object"
+            )
+        # The residual shape test is duck-typed: obtaining the iterator is
+        # also this entry's only pull on the container, so a non-iterable
+        # value ends as ValueError here while a valid iterator is not started
+        # until the container boundary has crossed.
+        try:
+            iterator = iter(entries)
+        except TypeError:
+            raise ValueError(
+                "entries must be an iterable of entries, got "
+                f"{type(entries).__name__}"
+            ) from None
+        # Materialize only after the container boundary has crossed: this is
+        # the single consumption of the iterator (it is never read again,
+        # inside or outside the lease), and each produced entry is validated
+        # as it arrives, so a bad entry -- or an iterator that raises -- ends
+        # the call before the lease and any history read.
+        norm = []
+        for entry in iterator:
+            norm.append(self._validate_many_entry(entry))
+        if not norm:
+            return []
+        with self._write_lease() as f:
+            # Identical indivisible commit as append_many: one exclusive
+            # lease on the description used for both reading and writing
+            # covers the per-tenant full-chain scans and the single block
+            # write, so the group serializes wholly before or wholly after
+            # competing writes and shared-lease readers observe only the
+            # complete pre-commit or post-commit history. Serialization,
+            # hashing, the per-tenant seq/prev chaining and the
+            # missing-newline prefix are exactly append_many's, so the
+            # committed JSONL bytes and the returned records are
+            # byte-for-byte what append_many produces for the same entries
+            # over the same history.
+            return self._append_many_locked(f, norm)
 
     @contextlib.contextmanager
     def _heads_lease(self, norm):
