@@ -1,10 +1,25 @@
 import contextlib
-import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    # Non-POSIX platforms (Windows) have no fcntl; the msvcrt backend
+    # below provides the equivalent process-level leases there. Neither
+    # importing this module nor constructing an AuditChain may depend on
+    # a lock backend being present, so the fallback is resolved only
+    # when a lease is actually taken.
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    # POSIX platforms have no msvcrt; the fcntl backend above is used.
+    msvcrt = None
 
 ZERO = "0" * 64
 FIELDS = ("tenant", "seq", "event", "prev", "hash")
@@ -334,6 +349,24 @@ class AuditChainRangeError(Exception):
         super().__init__(
             f"audit chain range error for tenant {tenant!r}: "
             f"requested [{start_seq}, {end_seq}] of {count} records"
+        )
+
+
+class AuditChainLockError(Exception):
+    # A process-level lease an operation requires could not be
+    # established: the running platform provides no lock backend with the
+    # required shared/exclusive semantics, the lock primitive failed to
+    # initialize, or the lock itself could not be acquired. reason is
+    # fixed; operation names the entry point whose lease failed and path
+    # the log file it guarded. The failed operation did not append,
+    # truncate, replace or return partial data, and no lock state is
+    # left held after the raise, on any platform.
+    def __init__(self, operation, path):
+        self.operation = operation
+        self.path = path
+        self.reason = "lock"
+        super().__init__(
+            f"could not acquire {operation} lock for audit log {path}"
         )
 
 
@@ -736,49 +769,121 @@ class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
 
+    @staticmethod
+    def _lock_fd(fd, exclusive, operation, path):
+        # Acquire one process-level lease on an open file description:
+        # exclusive for one read-modify-append, shared for a consistent
+        # read-only snapshot. The backend is chosen at call time, never
+        # at import: POSIX uses fcntl.flock, which is tied to the open
+        # file description and excludes both other processes and other
+        # threads (every lease here is taken on a fresh description);
+        # Windows uses msvcrt.locking on the same description. A backend
+        # that is missing, fails to initialize or cannot grant the lock
+        # raises AuditChainLockError, so a lock failure looks identical
+        # on every platform and never surfaces a partial operation.
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            except OSError as exc:
+                raise AuditChainLockError(operation, path) from exc
+            return
+        if msvcrt is not None:
+            # msvcrt offers only exclusive byte-range locks, so a shared
+            # lease is conservatively taken as an exclusive one: readers
+            # serialize against each other but still only ever observe a
+            # complete pre- or post-append snapshot, which is the only
+            # semantics every read entry point relies on. The locked
+            # region is one byte at offset 0 -- a byte-range lock may
+            # extend past end-of-file, so an empty log locks exactly the
+            # same way -- measured from the file's current position,
+            # hence the seek. LK_LOCK waits with bounded retries and
+            # raises OSError when the lock cannot be obtained, surfaced
+            # here as AuditChainLockError.
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            except OSError as exc:
+                raise AuditChainLockError(operation, path) from exc
+            return
+        raise AuditChainLockError(operation, path)
+
+    @staticmethod
+    def _unlock_fd(fd):
+        # Release a lease taken by _lock_fd. Closing the description
+        # would release it too (both flock and LockFile locks drop on
+        # close); the explicit release keeps the unlock next to the
+        # lock. The msvcrt region must match the locked one exactly, so
+        # the position is rewound to offset 0 first.
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
     @contextlib.contextmanager
-    def _dir_lease(self):
+    def _dir_lease(self, operation="dir"):
         # Auxiliary exclusive lease on the containing directory itself. It
         # never carries data bytes; its only job is to make the moment a data
         # file first appears indivisible relative to a conditional append
         # that is allowed to create the file only on its winning branch.
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        dfd = os.open(self.path.parent, os.O_RDONLY)
+        if fcntl is None:
+            if msvcrt is not None:
+                # Windows cannot open a directory through os.open, so no
+                # directory lease exists there. It is not needed for
+                # correctness: every lease body that probes the data
+                # file's existence re-validates the probed state under
+                # the data-file lease before acting on it (see
+                # _head_lease, _heads_lease and compact), so the probe
+                # alone never decides an irreversible outcome -- a losing
+                # assertion still creates nothing, and a winning creation
+                # is serialized by the data-file lock itself.
+                yield
+                return
+            raise AuditChainLockError(operation, str(self.path))
         try:
-            fcntl.flock(dfd, fcntl.LOCK_EX)
+            dfd = os.open(self.path.parent, os.O_RDONLY)
+        except OSError as exc:
+            raise AuditChainLockError(operation, str(self.path)) from exc
+        try:
+            self._lock_fd(dfd, True, operation, str(self.path))
+        except BaseException:
+            os.close(dfd)
+            raise
+        try:
             yield
         finally:
-            fcntl.flock(dfd, fcntl.LOCK_UN)
+            self._unlock_fd(dfd)
             os.close(dfd)
 
     @contextlib.contextmanager
-    def _write_lease(self):
+    def _write_lease(self, operation="write"):
         # Exclusive lease for one read-modify-append. The same open file
         # description carries the lock, the history read and the final append:
-        # flock is tied to that description, so the lease cannot be silently
+        # the lock is tied to that description, so the lease cannot be silently
         # lost to a second open of the path, and the bytes appended are the
         # ones computed from the bytes just read. A fresh fd per call makes
-        # flock genuinely exclude both other processes and other threads.
+        # the lease genuinely exclude both other processes and other threads.
         # The creating open happens inside the directory lease, so a
         # conditional append probing a not-yet-existing path cannot race the
         # file's first appearance (see append_if_head); the lease is released
         # again before blocking on the data file, so it never serializes
         # unrelated chains in the same directory for a write's duration.
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._dir_lease():
+        with self._dir_lease(operation):
             f = open(self.path, "a+b")
         try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            self._lock_fd(f.fileno(), True, operation, str(self.path))
             f.seek(0)
             yield f
             # Flush while the lease is still held, so the lock is released
             # only after the full record has reached the kernel file.
             f.flush()
         finally:
-            # Closing the description also releases the flock.
+            # Closing the description also releases the lock.
             f.close()
 
-    def _read_snapshot(self):
+    def _read_snapshot(self, operation="read"):
         # One complete, self-consistent read-only view, protected by a shared
         # lease on the data file itself. The file is opened O_RDONLY, so a
         # verify never creates the path: when it does not exist yet that is a
@@ -789,11 +894,14 @@ class AuditChain:
             f = open(self.path, "rb")
         except FileNotFoundError:
             return b""
+        locked = False
         try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            self._lock_fd(f.fileno(), False, operation, str(self.path))
+            locked = True
             return f.read()
         finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            if locked:
+                self._unlock_fd(f.fileno())
             f.close()
 
     @staticmethod
@@ -1150,7 +1258,7 @@ class AuditChain:
         # caller can never be turned into a different outcome by contention.
         _validate_json_value(tenant)
         _validate_json_value(event)
-        with self._write_lease() as f:
+        with self._write_lease("append") as f:
             # The scan and the write happen under one exclusive lease on the
             # very file description used for both, so the record is always
             # computed from the latest complete state right before its own
@@ -1228,7 +1336,7 @@ class AuditChain:
             _validate_json_value(event)
         if not events:
             return []
-        with self._write_lease() as f:
+        with self._write_lease("append_batch") as f:
             # One lease covers the whole read-build-append interval, so the
             # batch is an indivisible result for competing writers: their
             # records serialize wholly before or wholly after these, never
@@ -1287,7 +1395,7 @@ class AuditChain:
             materialized.append(event)
         if not materialized:
             return []
-        with self._write_lease() as f:
+        with self._write_lease("append_batch_stream") as f:
             # Identical indivisible commit as append_batch: one exclusive
             # lease on the description used for both reading and writing
             # covers the full-chain scan and the single block write, so the
@@ -1358,7 +1466,8 @@ class AuditChain:
         )[0]
 
     @contextlib.contextmanager
-    def _head_lease(self, tenant, expected_count, expected_hash):
+    def _head_lease(self, tenant, expected_count, expected_hash,
+                    operation="head"):
         # One exclusive lease covering validation-read, head comparison and
         # the write of a conditional append. On an existing log that is the
         # ordinary data-file lease; before the log exists, the data-file lock
@@ -1369,8 +1478,10 @@ class AuditChain:
         # comparison and a winning creation are therefore indivisible
         # relative to every other writer. Lock order is always
         # directory-then-data, so the nesting cannot deadlock against a plain
-        # append. _dir_lease also ensures the parent directory exists.
-        with self._dir_lease():
+        # append. _dir_lease also ensures the parent directory exists. On a
+        # platform without a directory lease the probe is re-validated under
+        # the data-file lease by the locked body, so the outcome is the same.
+        with self._dir_lease(operation):
             try:
                 f = open(self.path, "r+b")
             except FileNotFoundError:
@@ -1384,7 +1495,7 @@ class AuditChain:
                     )
                 f = open(self.path, "a+b")
             try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                self._lock_fd(f.fileno(), True, operation, str(self.path))
                 f.seek(0)
                 # When the file existed, assertions against the same head
                 # serialize here: one appends and observes (count, head),
@@ -1412,7 +1523,7 @@ class AuditChain:
         _validate_json_value(event)
         _validate_required_count(expected_count)
         _validate_expected_hash(expected_hash)
-        with self._head_lease(tenant, expected_count, expected_hash) as f:
+        with self._head_lease(tenant, expected_count, expected_hash, "append_if_head") as f:
             return self._append_if_head_locked(
                 f, tenant, event, expected_count, expected_hash
             )
@@ -1456,7 +1567,7 @@ class AuditChain:
         # records are numbered from expected_count + 1 with the first prev
         # equal to expected_hash, and the committed bytes are identical to
         # calling append for each event in order from the same head.
-        with self._head_lease(tenant, expected_count, expected_hash) as f:
+        with self._head_lease(tenant, expected_count, expected_hash, "append_batch_if_head") as f:
             return self._append_batch_if_head_locked(
                 f, tenant, events, expected_count, expected_hash
             )
@@ -1479,7 +1590,7 @@ class AuditChain:
             norm.append(_validate_many_entry(entry))
         if not norm:
             return []
-        with self._write_lease() as f:
+        with self._write_lease("append_many") as f:
             # One lease and one consistent snapshot cover the validation of
             # every affected chain and the single block write, so the whole
             # group commits as one indivisible byte interval: competing
@@ -1538,7 +1649,7 @@ class AuditChain:
             norm.append(_validate_many_entry(entry))
         if not norm:
             return []
-        with self._write_lease() as f:
+        with self._write_lease("append_many_stream") as f:
             # Identical indivisible commit as append_many: one exclusive
             # lease on the description used for both reading and writing
             # covers the per-tenant full-chain scans and the single block
@@ -1615,7 +1726,7 @@ class AuditChain:
         return items
 
     @contextlib.contextmanager
-    def _heads_lease(self, norm):
+    def _heads_lease(self, norm, operation="heads"):
         # Exclusive lease for one conditional multi-tenant commit shared by
         # append_many_if_heads and import_all_range: validation snapshot, every
         # head comparison and the single block write must be indivisible
@@ -1636,8 +1747,10 @@ class AuditChain:
         # against the (0, ZERO) actual head and is raised before any open that
         # could create the path. Lock order is always directory-then-data,
         # never deadlocking against a plain append. _dir_lease also makes the
-        # parent directory.
-        with self._dir_lease():
+        # parent directory. On a platform without a directory lease the probe
+        # is re-validated under the data-file lease by the locked body, so the
+        # outcome is the same.
+        with self._dir_lease(operation):
             try:
                 f = open(self.path, "r+b")
             except FileNotFoundError:
@@ -1655,7 +1768,7 @@ class AuditChain:
                     )
                 f = open(self.path, "a+b")
             try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                self._lock_fd(f.fileno(), True, operation, str(self.path))
                 f.seek(0)
                 yield f
             finally:
@@ -1810,7 +1923,7 @@ class AuditChain:
         # Concurrent commits on overlapping heads therefore have at most one
         # winner; every loser observes the winner's new tail inside the lease
         # and conflicts with that actual head.
-        with self._heads_lease(norm) as f:
+        with self._heads_lease(norm, "append_many_if_heads") as f:
             return self._append_many_if_heads_locked(f, norm)
 
     def _verify_all_snapshot(self, data, with_hash=False):
@@ -2135,7 +2248,7 @@ class AuditChain:
         # internal key so distinct types (1 vs "1") stay separate chains while
         # the original value is reported back unchanged. The shared lease
         # pins the snapshot to a state wholly before or after any append.
-        return self._verify_all_snapshot(self._read_snapshot())
+        return self._verify_all_snapshot(self._read_snapshot("verify_all"))
 
     def heads(self):
         # Read-only chain-head directory for every tenant in the log: the
@@ -2159,7 +2272,7 @@ class AuditChain:
         # creates nothing, modifies no byte, writes no cache and never
         # touches the network; concurrent appends only choose which complete
         # pre- or post-append snapshot the result corresponds to.
-        return self._verify_all_snapshot(self._read_snapshot(), with_hash=True)
+        return self._verify_all_snapshot(self._read_snapshot("heads"), with_hash=True)
 
     def _export_tenant_bytes(self, tenant):
         # Shared body of export_tenant and the chunked exporter: the caller
@@ -2171,7 +2284,7 @@ class AuditChain:
         # corrupt source raises AuditChainStateError instead of returning the
         # verified prefix. A missing or empty file is a legitimate empty
         # snapshot and yields b"".
-        data = self._read_snapshot()
+        data = self._read_snapshot("export_tenant")
         lines, bad_line = self._decode_lines(data)
         try:
             self._scan(tenant, lines, bad_line)
@@ -2259,7 +2372,7 @@ class AuditChain:
         # (same tenant/seq/reason/line as append/verify/export_tenant) even
         # when the requested interval lies entirely before the damage, and no
         # verified prefix is ever returned.
-        data = self._read_snapshot()
+        data = self._read_snapshot("export_tenant_range")
         lines, bad_line = self._decode_lines(data)
         try:
             count, _ = self._scan(tenant, lines, bad_line)
@@ -2314,7 +2427,7 @@ class AuditChain:
         # The verified bytes are returned verbatim (the exact snapshot,
         # interleaved tenant order included), so import_all can graft the
         # whole history onto an empty log with no re-serialization ambiguity.
-        data = self._read_snapshot()
+        data = self._read_snapshot("export_all")
         lines, bad_line = self._decode_lines(data)
         self._scan_all_chains(lines, bad_line)
         return data
@@ -2472,7 +2585,7 @@ class AuditChain:
         except _Broken as b:
             seq = b.at if b.at is not None else b.expect
             raise AuditChainStateError(tenant, seq, b.reason, b.line) from None
-        with self._write_lease() as f:
+        with self._write_lease("import_tenant") as f:
             # Target validation and the append share one exclusive lease on
             # the description used for both, so the graft is indivisible:
             # competing writers serialize wholly before or after it. A corrupt
@@ -2564,7 +2677,7 @@ class AuditChain:
         # operation. A not-yet-existing log may be created only by an exact
         # (0, ZERO) assertion; any other assertion is a deterministic
         # conflict against the (0, ZERO) actual head that leaves no file.
-        with self._head_lease(tenant, expected_count, expected_hash) as f:
+        with self._head_lease(tenant, expected_count, expected_hash, "import_tenant_range") as f:
             # A corrupt target is reported exactly as append reports it and
             # takes priority over the conflict check; a well-formed target
             # whose count and tail hash do not both match the assertion is a
@@ -2636,7 +2749,7 @@ class AuditChain:
             if key not in seen:
                 seen.add(key)
                 involved.append(item["tenant"])
-        with self._write_lease() as f:
+        with self._write_lease("import_all") as f:
             # Target validation and the append share one exclusive lease on
             # the description used for both, so check-and-commit is a single
             # atomic operation: competing writers and shared-lease readers
@@ -2868,7 +2981,7 @@ class AuditChain:
             (tenant, None, expected_count, expected_hash)
             for tenant, expected_count, expected_hash in assertions
         ]
-        with self._heads_lease(norm) as f:
+        with self._heads_lease(norm, "import_all_range") as f:
             # Only the chains this input involves are scanned. A corrupt
             # involved chain raises AuditChainStateError (same
             # tenant/seq/reason/line as append, first physical line then
@@ -3038,7 +3151,7 @@ class AuditChain:
         # is the full tenant history either wholly before or wholly after any
         # concurrent append, never a torn page. A missing path or an unknown
         # tenant is simply an empty chain and yields [].
-        data = self._read_snapshot()
+        data = self._read_snapshot("read_tenant")
         lines, bad_line = self._decode_lines(data)
         try:
             # The whole tenant history -- first record through chain tail --
@@ -3091,7 +3204,7 @@ class AuditChain:
         # append/export_tenant, reason only missing/sequence/digest) instead
         # of surfacing a head computed over a broken history. The scan never
         # creates or modifies the log and writes no cache.
-        data = self._read_snapshot()
+        data = self._read_snapshot("head")
         lines, bad_line = self._decode_lines(data)
         try:
             count, last = self._scan(tenant, lines, bad_line)
@@ -3137,7 +3250,7 @@ class AuditChain:
         _validate_json_value(tenant)
         _validate_expected_count(expected_count)
         return self._verify_snapshot(
-            tenant, self._read_snapshot(), expected_count
+            tenant, self._read_snapshot("verify"), expected_count
         )
 
     def verify_bytes(self, data, tenant, expected_count=None):
@@ -3674,7 +3787,7 @@ class AuditChain:
         # snapshot matching an empty expectation yields the empty directory.
         # No network or remote anchor is involved.
         assertions = _validate_expected_heads(expected_heads)
-        return self._verify_heads_snapshot(self._read_snapshot(), assertions)
+        return self._verify_heads_snapshot(self._read_snapshot("verify_heads"), assertions)
 
     def verify_heads_bytes(self, data, expected_heads):
         # Pure in-memory, offline expected-head directory check: the offline
@@ -3792,7 +3905,7 @@ class AuditChain:
         # instead of returning a partial manifest. This creates no file,
         # modifies no byte, writes no cache or sidecar log and never touches
         # the network.
-        return self._manifest_snapshot(self._read_snapshot())
+        return self._manifest_snapshot(self._read_snapshot("manifest"))
 
     def manifest_bytes(self, data):
         # Pure in-memory counterpart of manifest over a caller-supplied
@@ -3903,8 +4016,10 @@ class AuditChain:
         # _head_lease, so this cannot deadlock against a plain append, and
         # competing appends, readers and verifiers only ever observe the
         # complete pre-compact or the complete post-compact snapshot, never
-        # a partially rewritten file.
-        with self._dir_lease():
+        # a partially rewritten file. On a platform without a directory
+        # lease the existence probe is re-validated under the data-file
+        # lease below, so the outcome is the same.
+        with self._dir_lease("compact"):
             try:
                 f = open(self.path, "r+b")
             except FileNotFoundError:
@@ -3913,7 +4028,7 @@ class AuditChain:
                 # version-1 manifest and create nothing.
                 return self._manifest_snapshot(b"")
             try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                self._lock_fd(f.fileno(), True, "compact", str(self.path))
                 f.seek(0)
                 data = f.read()
                 if not data:
@@ -4122,7 +4237,7 @@ class AuditChain:
         # log verified against the empty version-1 manifest matches that
         # way. No network or remote anchor is involved.
         manifest = _validate_manifest(manifest)
-        return self._verify_manifest_snapshot(self._read_snapshot(), manifest)
+        return self._verify_manifest_snapshot(self._read_snapshot("verify_manifest"), manifest)
 
     def verify_manifest_bytes(self, data, manifest):
         # Pure in-memory, offline manifest check: the offline counterpart of
