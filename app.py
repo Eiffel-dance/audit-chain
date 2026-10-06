@@ -828,6 +828,196 @@ class _TenantRangeScan:
         }
 
 
+class _AllRangeScan:
+    # Internal incremental engine behind verify_all_range_bytes and
+    # verify_all_range_chunks: the multi-tenant counterpart of
+    # _TenantRangeScan. A backup fragment may carry several tenants' records
+    # interleaved in physical order, and every line must be a record of one
+    # of the canonical JSON tenant identities the assertions name, each
+    # tenant continuing from the verified tail the caller declared -- the
+    # first expected seq is expected_count+1 and the first prev must equal
+    # the asserted hash. No AuditChain path is ever probed, read or created.
+    #
+    # The mechanics are _TenantRangeScan's exactly: bytes accumulate behind
+    # LF-only physical-line boundaries, strict UTF-8 decoding waits for the
+    # completed line, chunks may be cut at any UTF-8/JSON/LF position and
+    # the first defective completed line stops feed, so a chunked caller
+    # never pulls another chunk. Every physical line is checked with the
+    # exact strict rules _scan_import_ranges applies to an import_all_range
+    # input: strict UTF-8 then strict standard JSON (duplicate keys and
+    # non-standard numbers rejected), a single object carrying exactly the
+    # five FIELDS keys of a listed tenant, the strict JSON-integer seq
+    # (1.0/1e0, bool, string and other spellings are sequence, never
+    # renumbered), the predecessor digest and a recomputed current hash.
+    #
+    # The first verdict is kept in _defect as a dict shaped exactly like the
+    # public failure result ({ok: False, at, tenant, seq, reason}); a
+    # record of another canonical tenant identity no assertion lists
+    # violates the fragment contract and is raised as _ForeignTenant
+    # (surfaced as ValueError), decided by physical line order against a
+    # chain defect on a prior line. After all lines, a non-empty fragment in
+    # which a listed tenant never appears is still a defect: that tenant's
+    # first owed seq (expected_count+1), missing. An empty fragment is a
+    # success carrying every declared tenant's unchanged head.
+    def __init__(self, chain, assertions):
+        self._chain = chain
+        # assertions: validated (tenant, expected_count, expected_hash)
+        # tuples in expected_heads order; the original tenant values are
+        # kept verbatim and the order is the success result's order.
+        self._assertions = assertions
+        # serialized tenant key -> [expected_seq, prev_hash, seen]
+        self._states = {}
+        for tenant, expected_count, expected_hash in assertions:
+            self._states[chain._tenant_key(tenant)] = [
+                expected_count + 1, expected_hash, False]
+        self._buffer = b""
+        self._line_no = 0
+        self._defect = None
+
+    def feed(self, chunk):
+        # Fold one bytes chunk into the running fragment and validate every
+        # physical line it completes, exactly the _TenantRangeScan loop: a
+        # completed line is checked the instant its LF arrives, so the first
+        # defective line (or a foreign tenant) ends the scan and a chunked
+        # caller never requests another chunk. Returns the kept verdict dict
+        # or None while the fragment stays valid.
+        if self._defect is not None:
+            return self._defect
+        self._buffer += chunk
+        while True:
+            idx = self._buffer.find(b"\n")
+            if idx < 0:
+                return None
+            line_bytes = self._buffer[:idx]
+            self._buffer = self._buffer[idx + 1:]
+            self._line_no += 1
+            self._check_line(line_bytes)
+            if self._defect is not None:
+                return self._defect
+
+    def end(self):
+        # Finalize: the bytes pending after the last LF are the final
+        # physical line (a fragment need not end with LF), then each listed
+        # tenant of a non-empty fragment must have appeared. Returns the
+        # kept verdict dict or None when the fragment fully verifies.
+        if self._defect is not None:
+            return self._defect
+        if self._buffer:
+            self._line_no += 1
+            pending, self._buffer = self._buffer, b""
+            self._check_line(pending)
+            if self._defect is not None:
+                return self._defect
+        # A non-empty fragment that names no record for a declared tenant
+        # is missing that tenant's first owed seq; the first such tenant in
+        # expected_heads order decides. An empty (zero physical line)
+        # fragment is a legal no-record continuation for every tenant.
+        if self._line_no > 0:
+            for tenant, expected_count, _head in self._assertions:
+                state = self._states[self._chain._tenant_key(tenant)]
+                if not state[2]:
+                    self._defect = self._fail(
+                        "missing", None, tenant, expected_count + 1)
+                    return self._defect
+        return None
+
+    def _fail(self, reason, at, tenant, seq):
+        # Failure objects carry a fixed field set: ok, at, tenant, seq,
+        # reason. at/tenant/seq are null wherever they cannot be determined.
+        return {
+            "ok": False,
+            "at": at,
+            "tenant": tenant,
+            "seq": seq,
+            "reason": reason,
+        }
+
+    def _check_line(self, line_bytes):
+        # Validate one complete physical line with the exact strict rules
+        # _scan_import_ranges uses: strict UTF-8 then strict standard JSON
+        # (duplicate keys and non-standard numbers rejected), a single
+        # object of a listed canonical tenant identity carrying exactly the
+        # five FIELDS keys, the expected strict-JSON-integer seq, the
+        # predecessor digest and a recomputed current hash. The first
+        # problem in physical order decides and fills at/tenant/seq the way
+        # import_all_range's input scan locates it -- parse/object failures
+        # cannot name a tenant (all three None), a field/sequence/digest
+        # defect carries the physical line, the line's tenant and the
+        # expected seq (a missing-field line carrying its own plain-int seq
+        # reports that seq instead).
+        try:
+            raw = line_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self._defect = self._fail("missing", self._line_no, None, None)
+            return
+        try:
+            item = _strict_loads(raw)
+        except Exception:
+            self._defect = self._fail("missing", self._line_no, None, None)
+            return
+        if not isinstance(item, dict) or "tenant" not in item:
+            self._defect = self._fail("missing", self._line_no, None, None)
+            return
+        tenant = item["tenant"]
+        key = self._chain._tenant_key(tenant)
+        state = self._states.get(key)
+        if state is None:
+            # A canonical tenant identity no assertion lists violates the
+            # fragment contract (surfaced as ValueError by the public
+            # entries), the same rule _scan_import_ranges applies. It is
+            # decided in physical-line order, so an earlier defect on a
+            # prior line still takes priority.
+            raise _ForeignTenant(self._line_no)
+        expected, prev = state[0], state[1]
+        if set(item) != set(FIELDS):
+            seq = item.get("seq")
+            at_seq = seq if isinstance(seq, int) \
+                and not isinstance(seq, bool) else expected
+            self._defect = self._fail("missing", self._line_no, tenant, at_seq)
+            return
+        seq = item["seq"]
+        # Same strict JSON-integer seq rule as every other scan: 1.0/1e0,
+        # bools, strings, null, arrays/objects and mismatching integers are
+        # all sequence defects, never renumbered.
+        if isinstance(seq, bool) or not isinstance(seq, int) \
+                or seq != expected:
+            self._defect = self._fail("sequence", self._line_no,
+                                      tenant, expected)
+            return
+        if item["prev"] != prev:
+            self._defect = self._fail("digest", self._line_no,
+                                      tenant, expected)
+            return
+        if item["hash"] != self._chain._hash(item):
+            self._defect = self._fail("digest", self._line_no,
+                                      tenant, expected)
+            return
+        state[0] += 1
+        state[1] = item["hash"]
+        state[2] = True
+
+    def result(self):
+        # Project a fully verified fragment into the public success shape:
+        # tenants follow the expected_heads order (not physical
+        # first-appearance order), each entry giving the count and tail
+        # hash after receiving the fragment -- count = expected_count +
+        # records seen, hash = the declared hash when the tenant got no
+        # record (empty fragment), else its last verified record's hash --
+        # directly usable as the predecessor head of a next segment.
+        tenants = []
+        for tenant, _expected_count, _expected_hash in self._assertions:
+            state = self._states[self._chain._tenant_key(tenant)]
+            # state[0] is the next expected seq, so state[0]-1 is exactly
+            # the record count after the fragment: expected_count when the
+            # tenant got no record, expected_count + n when it did.
+            tenants.append({
+                "tenant": tenant,
+                "count": state[0] - 1,
+                "hash": state[1],
+            })
+        return {"ok": True, "tenants": tenants}
+
+
 class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
@@ -3518,6 +3708,132 @@ class AuditChain:
             raise ValueError(
                 f"range data must contain only tenant {tenant!r}; "
                 f"a record of another tenant appears at line {ft.line}"
+            ) from None
+        if scan._defect is not None:
+            return scan._defect
+        return scan.result()
+
+    def verify_all_range_bytes(self, data, expected_heads):
+        # Pure in-memory, read-only offline check of a multi-tenant
+        # interval: prove that several tenants' interleaved backup
+        # fragments continue, from their declared chain heads, before the
+        # bytes are ever written to a target log. The caller supplies the
+        # JSONL bytes and expected_heads, an ordered list of the verified
+        # tails in front of the fragment; this entry never reads, creates
+        # or modifies the path this AuditChain points at, never touches the
+        # network and writes no sidecar file.
+        #
+        # expected_heads is validated by the exact boundary
+        # import_all_range uses: it must be a list whose members are
+        # objects carrying exactly the keys tenant, expected_count and
+        # expected_hash; the tenant crosses the same standard-JSON boundary
+        # as append/verify/export, expected_count must be a non-negative
+        # plain int (bool rejected even though it subclasses int; negative,
+        # float, string and other types are too) and expected_hash must be
+        # exactly the 64 lowercase hex characters of a sha256 digest; a
+        # canonical JSON tenant identity (json.dumps(..., sort_keys=True))
+        # may appear at most once (object key order normalized away, while
+        # 1, 1.0, true and "1" stay unrelated tenants). Every shape, type,
+        # format and uniqueness failure -- including a cyclic tenant
+        # container -- is ValueError raised before a single byte is read or
+        # parsed, so it takes strict priority over every content verdict,
+        # and the constructor path is neither probed nor created. data must
+        # be exactly bytes (bytearray, str and every other type ValueError
+        # before parsing).
+        #
+        # The whole boundary crossed, the bytes are treated as one
+        # multi-tenant migration fragment: strict UTF-8, LF-only physical
+        # lines (a trailing CR stays on its line and strict JSON accepts
+        # it), standard JSON (duplicate keys, NaN/Infinity/-Infinity and
+        # overflowing numbers rejected), every physical line an object
+        # carrying exactly the five FIELDS keys of one declared tenant,
+        # each chain continuing from expected_count+1 and expected_hash,
+        # seqs running continuously with every prev and current hash
+        # rechecked by the existing digest rules. A record of a tenant no
+        # assertion names violates the fragment contract and is ValueError
+        # by first physical line. The first content defect in physical
+        # order returns the fixed failure object
+        # {"ok": False, "at", "tenant", "seq", "reason"} -- "at" the
+        # physical line number, "seq" the expected seq (the record's own
+        # plain-int seq on a missing-field line that carries one), each
+        # null when it cannot be determined; reason is missing for an
+        # unparsable/blank line, a non-object, an illegal encoding,
+        # missing/extra fields or a non-empty fragment that never names a
+        # declared tenant (located at that tenant's first owed seq, at
+        # null), sequence for a wrong seq and digest for a wrong prev or
+        # hash. An empty fragment is a success whose tenants are the
+        # unchanged declared heads. Success returns {"ok": True,
+        # "tenants": [...]} ordered by expected_heads (not physical
+        # appearance), each entry giving the count and tail hash after the
+        # fragment -- directly usable as the predecessor head of the next
+        # segment.
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        assertions = self._validate_import_range_heads(expected_heads)
+        scan = _AllRangeScan(self, assertions)
+        try:
+            scan.feed(data)
+            scan.end()
+        except _ForeignTenant as ft:
+            raise ValueError(
+                "range data must contain only tenants named by "
+                f"expected_heads; a record of another tenant appears at "
+                f"line {ft.line}"
+            ) from None
+        if scan._defect is not None:
+            return scan._defect
+        return scan.result()
+
+    def verify_all_range_chunks(self, chunks, expected_heads):
+        # Chunked offline counterpart of verify_all_range_bytes: the
+        # interleaved multi-tenant fragment arrives as an ordered iterable
+        # of single-consumption bytes chunks instead of one contiguous
+        # buffer, so a streamed backup can be confirmed continuous before
+        # it is written to the target log without ever assembling the full
+        # bytes. Chunks may be cut at any byte boundary -- a UTF-8
+        # sequence, a JSON object or an LF -- and empty chunks are
+        # allowed; only their in-order concatenation is the fragment, so
+        # for the same concatenation this result is field-for-field
+        # exactly what verify_all_range_bytes returns. The iterator is
+        # pulled exactly once and only forward, an exception the iterator
+        # itself raises propagates verbatim, and like the bytes entry this
+        # never reads, creates or modifies the configured path, never
+        # touches the network and writes no sidecar file.
+        #
+        # expected_heads crosses the exact boundary
+        # verify_all_range_bytes documents before the chunk container is
+        # even iterated, so a malformed expectation never pulls a chunk.
+        # The container boundary is exactly verify_all_chunks'/
+        # heads_chunks': a bare bytes or bytearray object is not a chunk
+        # container (its iteration would yield ints), a non-iterable
+        # container or a non-bytes (bytearray included) member are
+        # ValueError, and the first bad member ends consumption at once.
+        # The first defective completed line -- a missing/sequence/digest
+        # verdict or an undeclared-tenant ValueError -- likewise stops the
+        # pull, so later chunks are never requested. Verdicts and the
+        # success shape are the bytes entry's exactly.
+        assertions = self._validate_import_range_heads(expected_heads)
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        iterator = self._chunk_iterator(chunks)
+        scan = _AllRangeScan(self, assertions)
+        try:
+            for chunk in iterator:
+                if not isinstance(chunk, bytes):
+                    raise ValueError(
+                        f"each chunk must be bytes, got {type(chunk).__name__}"
+                    )
+                if scan.feed(chunk) is not None:
+                    return scan._defect
+            scan.end()
+        except _ForeignTenant as ft:
+            raise ValueError(
+                "range data must contain only tenants named by "
+                f"expected_heads; a record of another tenant appears at "
+                f"line {ft.line}"
             ) from None
         if scan._defect is not None:
             return scan._defect
