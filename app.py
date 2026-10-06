@@ -529,6 +529,162 @@ class _StreamScan:
         }
 
 
+class _RangeVerifyScan:
+    # Internal incremental engine behind verify_tenant_range_bytes and
+    # verify_tenant_range_chunks. A detached single-tenant chain segment
+    # (typically cut from a backup by export_tenant_range) arrives as an
+    # ordered stream of bytes chunks and is validated one physical line at
+    # a time, so the chunked entry never has to assemble the full bytes and
+    # stops pulling the moment the first problem is determined; the bytes
+    # entry feeds its whole buffer through the very same engine, which is
+    # what makes the two entries agree field for field on the same
+    # concatenated content. Chunks may be cut at any byte boundary
+    # (mid-UTF-8-sequence, mid-JSON-object or mid-LF) and empty chunks are
+    # allowed; only the in-order concatenation is the segment.
+    #
+    # Physical lines are bounded by exactly one character, the byte 0x0A
+    # (LF); a trailing CR stays attached to its line the way _split_lf
+    # keeps it, and the empty segment after a final LF is not an extra
+    # line -- the same LF-boundary rule every other entry point shares. A
+    # line's bytes are strict-UTF-8 decoded only once the line is complete
+    # (at its LF, or at end() for the final LF-less tail), then parsed with
+    # the same strict standard-JSON decoder _scan_import_range uses
+    # (_strict_loads: duplicate keys and non-standard numbers rejected).
+    # Every line must be an object carrying exactly the five FIELDS of the
+    # one declared canonical tenant identity; seqs must run start_seq,
+    # start_seq+1, ... continuously and never past a declared end_seq, with
+    # the first prev equal to expected_prev and every hash recomputed with
+    # the shared digest rule. The first problem in physical line order is
+    # kept:
+    #   * ("missing", at)   -- an undecodable/unparseable line, a
+    #     non-object, a line without a tenant key, or a field set that is
+    #     not exactly FIELDS ("at" is the record's own plain-int seq when a
+    #     field-defective line carries one, else the physical line); an
+    #     empty fragment or a declared end_seq the records never reach
+    #     ("at" is the first uncovered seq);
+    #   * ("sequence", at)  -- a seq that is not the next expected plain
+    #     integer, including a record beyond the declared end_seq ("at" is
+    #     the expected seq);
+    #   * ("digest", at)    -- a prev or hash mismatch ("at" is the
+    #     expected seq);
+    #   * foreign line      -- a record of any other canonical JSON tenant
+    #     identity violates the single-tenant fragment contract and is
+    #     surfaced as ValueError by the entry points.
+    # count and last_hash describe the verified fragment tail.
+    def __init__(self, chain, tenant, start_seq, end_seq, expected_prev):
+        self._chain = chain
+        self._key = chain._tenant_key(tenant)
+        self._start_seq = start_seq
+        self._end_seq = end_seq
+        self._expected = start_seq
+        self._prev = expected_prev
+        self.count = 0
+        self.last_hash = None
+        # Stream mechanics: pending bytes after the last processed LF, the
+        # completed physical-line count and the first problem found (None
+        # while the fragment stays valid).
+        self._buffer = b""
+        self._line_no = 0
+        self._defect = None
+        self._foreign_line = None
+
+    def feed(self, chunk):
+        # Fold one bytes chunk into the running stream and validate every
+        # physical line it completes. Returns the first problem tuple (kept
+        # for end()) or None while the fragment stays valid.
+        if self._defect is not None or self._foreign_line is not None:
+            return self._problem()
+        self._buffer += chunk
+        while True:
+            idx = self._buffer.find(b"\n")
+            if idx < 0:
+                return None
+            line_bytes = self._buffer[:idx]
+            self._buffer = self._buffer[idx + 1:]
+            self._line_no += 1
+            if self._check_line(line_bytes) is not None:
+                return self._problem()
+
+    def end(self):
+        # Finalize the stream: the bytes still pending after the last LF
+        # are the final physical line (a fragment need not end with LF).
+        # Only a fully valid line stream reaches the fragment-level checks:
+        # an empty fragment is missing at start_seq, and a declared end_seq
+        # the records never reach is missing at the first uncovered seq.
+        if self._defect is None and self._foreign_line is None:
+            if self._buffer:
+                self._line_no += 1
+                self._check_line(self._buffer)
+                self._buffer = b""
+            if self._defect is None and self._foreign_line is None:
+                if self.count == 0:
+                    self._defect = ("missing", self._start_seq)
+                elif self._end_seq is not None \
+                        and self._expected <= self._end_seq:
+                    self._defect = ("missing", self._expected)
+        return self._problem()
+
+    def _problem(self):
+        if self._foreign_line is not None:
+            return ("foreign", self._foreign_line)
+        return self._defect
+
+    def _check_line(self, line_bytes):
+        # Validate one complete physical line against the fragment
+        # contract, line for line the rules _scan_import_range applies:
+        # strict UTF-8, strict standard JSON, an object of exactly the five
+        # FIELDS naming the declared canonical tenant identity, the next
+        # expected plain-int seq, the running prev and a recomputed hash.
+        # The first problem is recorded and returned; a record of another
+        # tenant identity is kept as the foreign line (the entry points
+        # surface it as ValueError).
+        try:
+            raw = line_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self._defect = ("missing", self._line_no)
+            return self._defect
+        try:
+            item = _strict_loads(raw)
+        except Exception:
+            self._defect = ("missing", self._line_no)
+            return self._defect
+        if not isinstance(item, dict) or "tenant" not in item:
+            self._defect = ("missing", self._line_no)
+            return self._defect
+        if self._chain._tenant_key(item["tenant"]) != self._key:
+            self._foreign_line = self._line_no
+            return self._problem()
+        if set(item) != set(FIELDS):
+            seq = item.get("seq")
+            at = seq if isinstance(seq, int) and not isinstance(seq, bool) \
+                else self._line_no
+            self._defect = ("missing", at)
+            return self._defect
+        seq = item["seq"]
+        # Same strict JSON-integer seq rule as _scan_import_range: a float
+        # spelling (1.0, 1e0), bool, string, null, array/object or a
+        # mismatching integer is a sequence defect, never renumbered; a
+        # record past a declared end_seq is the same overage verify's
+        # expected_count reports as sequence.
+        if isinstance(seq, bool) or not isinstance(seq, int) \
+                or seq != self._expected \
+                or (self._end_seq is not None
+                    and self._expected > self._end_seq):
+            self._defect = ("sequence", self._expected)
+            return self._defect
+        if item["prev"] != self._prev:
+            self._defect = ("digest", self._expected)
+            return self._defect
+        if item["hash"] != self._chain._hash(item):
+            self._defect = ("digest", self._expected)
+            return self._defect
+        self.count += 1
+        self._prev = item["hash"]
+        self.last_hash = item["hash"]
+        self._expected += 1
+        return None
+
+
 class AuditChain:
     def __init__(self, path):
         self.path = Path(path)
@@ -3843,3 +3999,165 @@ class AuditChain:
             return {"ok": False, "at": at, "tenant": tenant,
                     "reason": reason}
         return self._compare_manifest(manifest, scan.manifest_result())
+
+    def _validate_range_verify_bounds(self, tenant, start_seq, end_seq,
+                                      expected_prev):
+        # Shared input boundary of verify_tenant_range_bytes and
+        # verify_tenant_range_chunks, crossed before any data byte is read
+        # or any chunk is consumed: the tenant crosses the same
+        # standard-JSON rule as append/verify/export, start_seq must be a
+        # positive plain int and end_seq None (open tail) or a plain int
+        # not smaller than start_seq (bool rejected even though it
+        # subclasses int; floats and other types are too) -- exactly
+        # export_tenant_range's range boundary -- and expected_prev must be
+        # exactly the 64 lowercase hex characters of the digest the
+        # fragment's first record must name as its prev. A fragment
+        # starting at seq 1 continues the empty chain, so only ZERO is
+        # accepted there.
+        self._validate_range_bounds(tenant, start_seq, end_seq)
+        if not isinstance(expected_prev, str) or len(expected_prev) != 64 \
+                or any(c not in "0123456789abcdef" for c in expected_prev):
+            raise ValueError(
+                "expected_prev must be 64 lowercase hexadecimal characters, "
+                f"got {expected_prev!r}"
+            )
+        if start_seq == 1 and expected_prev != ZERO:
+            raise ValueError(
+                "expected_prev must be ZERO when start_seq is 1, got "
+                f"{expected_prev!r}"
+            )
+
+    def _range_verify_result(self, tenant, start_seq, end_seq, scan):
+        # Project a finished _RangeVerifyScan into the result both range
+        # verify entries return, so bytes and chunks agree field for field.
+        # A record of another canonical tenant identity violates the
+        # single-tenant fragment contract and is a caller error (ValueError),
+        # exactly the rule import_tenant_range applies to its input; a chain
+        # defect is the missing/sequence/digest verdict located by "at" with
+        # the declared interval echoed as the range locator; success carries
+        # the verified record count and the fragment's tail hash.
+        if scan._foreign_line is not None:
+            raise ValueError(
+                f"range data must contain only tenant {tenant!r}; "
+                f"a record of another tenant appears at line "
+                f"{scan._foreign_line}"
+            ) from None
+        if scan._defect is not None:
+            reason, at = scan._defect
+            return {
+                "ok": False, "at": at, "tenant": tenant, "reason": reason,
+                "start_seq": start_seq, "end_seq": end_seq,
+            }
+        return {
+            "ok": True, "tenant": tenant, "start_seq": start_seq,
+            "end_seq": end_seq, "count": scan.count, "hash": scan.last_hash,
+        }
+
+    def verify_tenant_range_bytes(self, tenant, start_seq, end_seq=None,
+                                  expected_prev=None, data=None):
+        # Read-only, offline single-tenant range verification: confirm that
+        # a detached migration fragment -- a closed interval of one tenant's
+        # chain, typically cut from a backup by export_tenant_range --
+        # really is the declared interval continuing the declared
+        # predecessor digest, without touching any target log. Pure
+        # in-memory entry like verify_bytes: it consumes only the given
+        # bytes, never reads, creates or modifies the path this AuditChain
+        # points at, never touches the network, keeps no cache or on-disk
+        # index and never mutates the buffer.
+        #
+        # Every boundary crosses before a single data byte is parsed: the
+        # tenant uses the same standard-JSON rule as append/verify/export,
+        # start_seq must be a positive plain int and end_seq None (open
+        # tail) or a plain int not smaller than start_seq (bool rejected
+        # even though it subclasses int; floats and other types are too),
+        # expected_prev must be exactly the 64 lowercase hex characters of
+        # the digest the first record must name as its prev -- a fragment
+        # starting at seq 1 continues the empty chain, so only ZERO is
+        # accepted there -- and data must be exactly bytes (bytearray, str
+        # and every other type are ValueError). A rejected call raises
+        # ValueError without parsing a byte.
+        #
+        # The fragment is then validated line by line with the shared
+        # strict rules (LF-only physical lines, strict UTF-8, standard JSON
+        # with duplicate keys and non-standard numbers rejected, canonical
+        # JSON tenant identity): every physical line must be an object
+        # carrying exactly the five FIELDS of the declared tenant (the
+        # import_tenant_range input contract), seqs must run start_seq,
+        # start_seq+1, ... continuously and never past a declared end_seq,
+        # the first prev must equal expected_prev and every hash is
+        # recomputed with the existing digest algorithm. An empty fragment,
+        # an undecodable/unparseable line, a missing/extra field or a
+        # declared end_seq the records never reach are "missing"; a seq
+        # that is not the next expected plain integer -- including a record
+        # beyond the declared end_seq -- is "sequence"; a prev or hash
+        # mismatch is "digest". The first problem in physical line order is
+        # reported as {"ok": False, "at", "tenant", "reason", "start_seq",
+        # "end_seq"}: "at" is the physical line for a missing-class line
+        # defect (the record's own plain-int seq when a field-defective
+        # line carries one) or the first uncovered seq for an empty or
+        # short fragment, and the expected seq for sequence/digest; tenant
+        # is the declared tenant and start_seq/end_seq echo the declared
+        # interval (end_seq None for the open tail) as the range locator.
+        # A record of any other canonical JSON tenant identity violates the
+        # single-tenant fragment contract and raises ValueError, decided in
+        # physical line order against the chain defects above.
+        #
+        # Success returns {"ok": True, "tenant", "start_seq", "end_seq",
+        # "count", "hash"} with the verified record count and the
+        # fragment's tail hash (a declared end_seq guarantees
+        # count == end_seq - start_seq + 1): exactly the anchor an
+        # import_tenant_range(tenant, data, start_seq - 1, expected_prev)
+        # graft asserts, plus the new chain head (start_seq - 1 + count,
+        # hash) the graft produces.
+        self._validate_range_verify_bounds(tenant, start_seq, end_seq,
+                                           expected_prev)
+        if not isinstance(data, bytes):
+            raise ValueError(f"data must be bytes, got {type(data).__name__}")
+        scan = _RangeVerifyScan(self, tenant, start_seq, end_seq,
+                                expected_prev)
+        scan.feed(data)
+        scan.end()
+        return self._range_verify_result(tenant, start_seq, end_seq, scan)
+
+    def verify_tenant_range_chunks(self, tenant, start_seq, end_seq=None,
+                                   expected_prev=None, chunks=None):
+        # Chunked offline counterpart of verify_tenant_range_bytes: the
+        # detached single-tenant fragment arrives as an ordered iterable of
+        # bytes chunks instead of one contiguous buffer, so the caller
+        # never has to assemble it. Chunks may be cut at any byte boundary
+        # -- mid-UTF-8-sequence, mid-JSON-object or mid-LF -- and empty
+        # chunks are allowed; only their in-order concatenation is the
+        # fragment. The iterator is pulled exactly once and only forward.
+        # Like the bytes entry this consumes only caller data: it never
+        # reads, creates or modifies the configured path, never touches the
+        # network, keeps no cache or on-disk index and never mutates a
+        # chunk.
+        #
+        # The parameter boundary is exactly verify_tenant_range_bytes'
+        # boundary and crosses before a single chunk is pulled, so an
+        # illegal tenant, start_seq, end_seq or expected_prev never
+        # consumes one. The container boundary is exactly the other chunked
+        # entries': a bare bytes or bytearray object is not a chunk
+        # container (its iteration would yield ints), a non-iterable
+        # container or a non-bytes (bytearray included) member are all
+        # ValueError, the first bad member ending consumption at once. The
+        # fragment is validated incrementally with the very engine the
+        # bytes entry runs, so the result is field-for-field what
+        # verify_tenant_range_bytes returns for the same concatenated
+        # bytes; the first determined problem -- a chain defect or a
+        # foreign-tenant record -- stops the pull immediately and later
+        # chunks are never requested, while a fully valid fragment is
+        # consumed to the end.
+        self._validate_range_verify_bounds(tenant, start_seq, end_seq,
+                                           expected_prev)
+        if isinstance(chunks, (bytes, bytearray)):
+            raise ValueError(
+                "chunks must be an iterable of bytes, got a single "
+                f"{type(chunks).__name__} object"
+            )
+        scan = self._drive_stream(
+            _RangeVerifyScan(self, tenant, start_seq, end_seq,
+                             expected_prev),
+            self._chunk_iterator(chunks),
+        )
+        return self._range_verify_result(tenant, start_seq, end_seq, scan)
