@@ -2684,6 +2684,40 @@ class AuditChain:
         self._scan_all_chains(lines, bad_line)
         return data
 
+    def export_snapshot(self):
+        # Atomic whole-log snapshot export: the fused counterpart of calling
+        # export_all() and manifest() separately. Returns a read-only result
+        # carrying exactly the keys "data" and "manifest": "data" is the
+        # verified raw JSONL bytes of one complete snapshot (the exact bytes
+        # export_all returns -- tenant interleaving order, newlines and every
+        # original byte preserved verbatim, never reordered, re-serialized or
+        # re-lined), and "manifest" is the version-1 manifest computed from
+        # those very bytes, so byte_length and byte_sha256 correspond to
+        # "data" byte for byte and the tenants list (physical
+        # first-appearance order, each tenant's verified count and last
+        # record's hash) describes this exact snapshot. Because the manifest
+        # is derived from the same in-memory snapshot bytes, a concurrent
+        # append can only land wholly before or wholly after the pair --
+        # data and manifest can never come from two different append windows
+        # the way separate export_all()/manifest() calls can.
+        #
+        # Like export_all/manifest this entry is strictly read-only: it
+        # never creates, replaces or modifies the log, writes no manifest
+        # file, cache or other sidecar data and never touches the network.
+        # A missing or empty log is a legitimate empty snapshot and yields
+        # {"data": b"", "manifest": <the empty version-1 manifest>}. The
+        # complete snapshot is validated with the exact rules export_all
+        # uses before anything is returned, so a corrupt history raises
+        # AuditChainStateError (reason only missing/sequence/digest, located
+        # by tenant, seq and physical line exactly as export_all locates the
+        # first defect) instead of returning a partial result. "data" (or
+        # the re-concatenated chunks of export_snapshot_chunks) can be
+        # handed directly to verify_all_bytes, heads_bytes, manifest_bytes,
+        # compare_bytes and the offline import entry points with the same
+        # outcome as for this snapshot.
+        data = self._export_all_bytes("export_snapshot")
+        return {"data": data, "manifest": self._manifest_snapshot(data)}
+
     @staticmethod
     def _validate_chunk_size(chunk_size):
         # chunk_size names the maximum byte length of one produced export
@@ -2760,6 +2794,47 @@ class AuditChain:
         self._validate_chunk_size(chunk_size)
         data = self._export_all_bytes("export_all_chunks")
         return self._iter_fixed_chunks(data, chunk_size)
+
+    def export_snapshot_chunks(self, chunk_size):
+        # Chunked atomic whole-log snapshot export: the large-history
+        # counterpart of export_snapshot. Returns a read-only result carrying
+        # exactly the keys "manifest" and "chunks": "manifest" is the
+        # version-1 manifest of one complete snapshot (byte_length and
+        # byte_sha256 corresponding to the snapshot bytes exactly, tenants in
+        # physical first-appearance order with each tenant's verified count
+        # and last record's hash), and "chunks" is a one-shot iterator of
+        # bytes chunks whose in-order concatenation is byte-for-byte the
+        # "data" export_snapshot returns for the same snapshot -- the
+        # verified raw JSONL bytes, tenant interleaving order and newlines
+        # included, never reordered or re-serialized. Chunks are cut on
+        # plain byte offsets and may split a UTF-8 sequence, a JSON object
+        # or a newline; every element is exactly bytes. Like export_snapshot
+        # this never creates, replaces or modifies the log, writes no
+        # sidecar data and never touches the network.
+        #
+        # chunk_size must be a positive plain int (bool rejected even though
+        # it subclasses int; floats, strings, zero and negatives too),
+        # checked before the result is produced or any history is read, so
+        # an illegal call raises ValueError immediately. The whole export is
+        # fixed to one complete snapshot: every tenant chain verifies over
+        # one shared-lease snapshot (the exact pass export_all runs) before
+        # the manifest and the first chunk are produced, so a corrupt source
+        # raises AuditChainStateError -- reason only missing/sequence/digest,
+        # located by tenant, seq and physical line exactly as export_all
+        # locates the first defect -- and no chunk is ever yielded for it; a
+        # concurrent append can only land wholly before or wholly after the
+        # snapshot, never between chunks. A missing or empty log is a
+        # legitimate empty snapshot and yields the empty version-1 manifest
+        # with zero chunks. The re-concatenated chunks can be handed
+        # directly to verify_all_bytes, heads_bytes, manifest_bytes,
+        # compare_bytes and the offline import entry points with the same
+        # outcome as for this snapshot.
+        self._validate_chunk_size(chunk_size)
+        data = self._export_all_bytes("export_snapshot_chunks")
+        return {
+            "manifest": self._manifest_snapshot(data),
+            "chunks": self._iter_fixed_chunks(data, chunk_size),
+        }
 
     def export_tenant_range_chunks(self, tenant, start_seq, end_seq=None,
                                    chunk_size=None):
