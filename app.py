@@ -2423,6 +2423,220 @@ class AuditChain:
         right_data = self._join_chunks(right_chunks)
         return self.compare_bytes(left_data, right_data)
 
+    def merge_bytes(self, left_data, right_data):
+        # Pure in-memory reconciliation of two independently kept, never
+        # remotely anchored histories into one snapshot that can keep being
+        # verified and migrated: it consumes only the two given bytes
+        # buffers, never reads, creates or modifies the path this AuditChain
+        # points at, never touches the network and never mutates either
+        # buffer.
+        #
+        # The type boundary crosses first, exactly as compare_bytes orders
+        # it: each argument must be exactly bytes -- bytearray, str and every
+        # other type are rejected with ValueError before either snapshot is
+        # parsed, so a non-bytes value can never reach the decoder and the
+        # left argument is checked before the right. Both buffers then run
+        # the full import_all contract in memory (the strict
+        # verify_all_bytes rules plus the exact-five-field rule): strict
+        # UTF-8, LF-only physical lines, standard JSON with duplicate keys
+        # and non-standard numbers rejected, an object on every line
+        # carrying exactly the tenant, seq, event, prev and hash fields,
+        # canonical JSON tenant identity, and per-tenant seq running 1..n
+        # from a ZERO prev with every digest recomputed. A corrupt side is
+        # never merged: the result is compare_bytes' first-corruption
+        # verdict {"ok": False, "side", "at", "tenant", "reason"} with
+        # reason only missing, sequence or digest, and when both sides are
+        # corrupt the left side is always reported (the right is not even
+        # scanned). Empty bytes are a legitimate empty history.
+        #
+        # Once both sides are valid, records align by canonical tenant
+        # identity and per-tenant seq regardless of physical interleaving.
+        # For every tenant one chain must be a prefix of the other (an
+        # absent side is the empty chain): a shared position whose event,
+        # prev or hash differs is a conflict. Conflicts are located in the
+        # left side's tenant first-appearance order followed by tenants only
+        # the right names, each from seq 1, so physical interleaving never
+        # decides and exactly one position is reported:
+        # {"ok": False, "reason": "conflict", "tenant", "seq", "left",
+        # "right"} with the two original records (the shorter-chain first
+        # missing position is never a conflict, since one chain is then a
+        # prefix of the other). No output is produced on any failure.
+        #
+        # On success {"ok": True, "data", "manifest"} is returned. data keeps
+        # the left records in their physical order and then appends, in the
+        # right's physical order, exactly the suffix records the left chain
+        # does not already hold; the shared prefix appears once. Every
+        # record is re-emitted with the exact canonical JSONL serialization
+        # append/export/import use (sort_keys, allow_nan=False, one LF), and
+        # tenant, seq, event, prev and hash -- digest values included -- are
+        # never rewritten, so data verifies under the existing offline rules
+        # and imports through import_all as-is. manifest is the version-1
+        # manifest computed byte for byte over that data (length, whole-data
+        # sha256, tenants in physical first-appearance order with count and
+        # last-record hash), field-for-field what manifest_bytes(data)
+        # returns.
+        if not isinstance(left_data, bytes):
+            raise ValueError(
+                "left_data must be bytes, got "
+                f"{type(left_data).__name__}"
+            )
+        if not isinstance(right_data, bytes):
+            raise ValueError(
+                "right_data must be bytes, got "
+                f"{type(right_data).__name__}"
+            )
+        # The merge output must itself satisfy the exact-five-field
+        # import_all contract, so each input is held to that contract rather
+        # than to the file scan's missing-fields-only rule; any extra field
+        # is a missing-class defect at that physical line.
+        left_lines, left_bad = self._decode_lines(left_data)
+        try:
+            left_records = self._scan_all_chains(
+                left_lines, left_bad, exact_fields=True)
+        except AuditChainStateError as error:
+            return self._merge_corruption("left", error)
+        right_lines, right_bad = self._decode_lines(right_data)
+        try:
+            right_records = self._scan_all_chains(
+                right_lines, right_bad, exact_fields=True)
+        except AuditChainStateError as error:
+            return self._merge_corruption("right", error)
+        left_chains = self._merge_group(left_records)
+        right_chains = self._merge_group(right_records)
+        # Tenant conflict order: the left side's first-appearance order, then
+        # any tenant only the right side names in its first-appearance
+        # order.
+        order = list(left_chains)
+        for key in right_chains:
+            if key not in left_chains:
+                order.append(key)
+        suffix_keys = set()
+        for key in order:
+            left_entry = left_chains.get(key)
+            right_entry = right_chains.get(key)
+            left_chain = left_entry[1] if left_entry is not None else []
+            right_chain = right_entry[1] if right_entry is not None else []
+            shared = min(len(left_chain), len(right_chain))
+            for i in range(shared):
+                left_item = left_chain[i]
+                right_item = right_chain[i]
+                # Alignment already fixes the tenant and seq; only event,
+                # prev and hash can disagree at a shared position, and any
+                # one of them is an unmergeable conflict.
+                if left_item["event"] != right_item["event"] \
+                        or left_item["prev"] != right_item["prev"] \
+                        or left_item["hash"] != right_item["hash"]:
+                    return {
+                        "ok": False,
+                        "reason": "conflict",
+                        "tenant": (left_entry if left_entry is not None
+                                   else right_entry)[0],
+                        "seq": i + 1,
+                        "left": left_item,
+                        "right": right_item,
+                    }
+            # The longer tail extends the shared prefix; record that the
+            # right holds records the left does not, so only those are
+            # appended below. Either chain being shorter is a valid prefix,
+            # never a conflict.
+            if len(right_chain) > len(left_chain):
+                suffix_keys.add(key)
+        # Nothing is assembled until every tenant has cleared the prefix
+        # rule, so a conflict verdict can never leave partial data. The
+        # output keeps the left's physical order verbatim, then the right's
+        # physical order restricted to suffix records (a right record whose
+        # tenant and seq are already in the left prefix is dropped).
+        right_prefix = {
+            key: len(left_chains.get(key, (None, []))[1])
+            for key in suffix_keys
+        }
+        right_seen = {key: 0 for key in suffix_keys}
+        right_keep = []
+        for item in right_records:
+            key = self._tenant_key(item["tenant"])
+            if key in suffix_keys:
+                index = right_seen[key]
+                right_seen[key] = index + 1
+                if index >= right_prefix[key]:
+                    right_keep.append(item)
+        merged = [
+            json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            for item in left_records
+        ]
+        merged.extend(
+            json.dumps(item, sort_keys=True, allow_nan=False) + "\n"
+            for item in right_keep
+        )
+        data = "".join(merged).encode("utf-8")
+        return {"ok": True, "data": data,
+                "manifest": self._manifest_snapshot(data)}
+
+    @staticmethod
+    def _merge_corruption(side, error):
+        # Shape a failed strict input scan into compare_bytes' exact
+        # first-corruption result. AuditChainStateError carries the defective
+        # line as .line and an expected seq as .seq, but this verdict locates
+        # the physical line and keeps verify_all_bytes' reason vocabulary, so
+        # seq never leaks into it.
+        return {
+            "ok": False,
+            "side": side,
+            "at": error.line,
+            "tenant": error.tenant,
+            "reason": error.reason,
+        }
+
+    def _merge_group(self, records):
+        # Group an already-verified exact-five-field snapshot's records by
+        # canonical tenant identity, preserving the first-appearance spelling
+        # of each tenant and the per-tenant seq order (identical to physical
+        # order within one tenant). Records arrive in physical order. Returns
+        # a dict (insertion-ordered) mapping the serialized tenant key to
+        # [tenant_value, [record, ...]].
+        chains = {}
+        for item in records:
+            tenant = item["tenant"]
+            key = self._tenant_key(tenant)
+            chain = chains.get(key)
+            if chain is None:
+                chain = [tenant, []]
+                chains[key] = chain
+            chain[1].append(item)
+        return chains
+
+    def merge_chunks(self, left_chunks, right_chunks):
+        # Chunked offline counterpart of merge_bytes: each side's JSONL
+        # history arrives as an ordered iterable of bytes chunks in file
+        # order rather than one contiguous buffer, so two streamed backups
+        # can be reconciled without the caller assembling either side.
+        # Chunks may be cut at any byte boundary -- mid-UTF-8-sequence,
+        # mid-line or mid-record -- empty chunks are allowed, and an empty
+        # iterable (or one holding only empty chunks) is the empty history;
+        # only each side's in-order concatenation is ever decoded. Like
+        # merge_bytes this consumes only caller data: it never reads,
+        # creates or modifies the path this AuditChain points at, never
+        # touches the network, keeps no cache or on-disk index and never
+        # mutates an input chunk.
+        #
+        # The container boundary crosses first on each side, exactly the
+        # boundary compare_chunks uses: a bare bytes or bytearray object is
+        # not a chunk container (its iteration would yield ints), a
+        # non-iterable container and a non-bytes (bytearray included)
+        # element are all ValueError, and the first bad element ends
+        # consumption of that side without pulling any further element. The
+        # left side is joined (and therefore consumed) completely before the
+        # right side is even probed, so a left boundary error wins over a
+        # right one and every boundary error on either side wins over the
+        # strict content validation. Only after both concatenations exist
+        # are they handed to merge_bytes, making the result field-for-field
+        # merge_bytes' verdict on the same bytes -- a corruption result
+        # (missing/sequence/digest, left first), one conflict result, or the
+        # canonical data plus its version-1 manifest -- with no partial data
+        # on any failure.
+        left_data = self._join_chunks(left_chunks)
+        right_data = self._join_chunks(right_chunks)
+        return self.merge_bytes(left_data, right_data)
+
     def compare(self, other):
         # Path-oriented read-only counterpart of compare_bytes: each side is
         # the complete on-disk JSONL state an AuditChain points at, so a caller
