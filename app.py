@@ -233,6 +233,53 @@ def _validate_many_entry(entry):
     return tenant, event
 
 
+def _validate_many_heads_entry(entry, seen):
+    # Member boundary shared by append_many_if_heads and
+    # append_many_if_heads_stream: one entry must be an object carrying
+    # exactly the keys tenant, events, expected_count and expected_hash.
+    # events must be a non-empty list whose every member crosses the same
+    # standard-JSON boundary as append's event, tenant crosses the same
+    # boundary as append's tenant, expected_count must be a non-negative
+    # plain int (bool rejected even though it subclasses int) and
+    # expected_hash exactly 64 lowercase hex characters (the empty-chain
+    # head is ZERO). A canonical JSON tenant identity may appear at most
+    # once across the whole group; seen is the caller's set of identities
+    # already consumed and is updated in place. Kept in one place so the
+    # list entry point and the single-consumption streaming entry point
+    # reject and accept exactly the same members, field for field. The
+    # returned tuple keeps the original tenant and events values verbatim.
+    if not isinstance(entry, dict) or set(entry) != {
+        "tenant", "events", "expected_count", "expected_hash"
+    }:
+        raise ValueError(
+            "each entry must be an object containing exactly the keys "
+            "'tenant', 'events', 'expected_count' and "
+            f"'expected_hash', got {entry!r}"
+        )
+    tenant = entry["tenant"]
+    events = entry["events"]
+    expected_count = entry["expected_count"]
+    expected_hash = entry["expected_hash"]
+    if not isinstance(events, list) or not events:
+        raise ValueError(
+            "events must be a non-empty list, got "
+            f"{events!r}"
+        )
+    _validate_json_value(tenant)
+    for event in events:
+        _validate_json_value(event)
+    _validate_required_count(expected_count)
+    _validate_expected_hash(expected_hash)
+    key = AuditChain._tenant_key(tenant)
+    if key in seen:
+        raise ValueError(
+            f"duplicate tenant entry (same canonical JSON identity): "
+            f"{tenant!r}"
+        )
+    seen.add(key)
+    return tenant, events, expected_count, expected_hash
+
+
 def _validate_manifest(manifest):
     # Manifest input boundary shared by verify_manifest,
     # verify_manifest_bytes and verify_manifest_chunks. The manifest is a
@@ -2115,36 +2162,7 @@ class AuditChain:
         norm = []
         seen = set()
         for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {
-                "tenant", "events", "expected_count", "expected_hash"
-            }:
-                raise ValueError(
-                    "each entry must be an object containing exactly the keys "
-                    "'tenant', 'events', 'expected_count' and "
-                    f"'expected_hash', got {entry!r}"
-                )
-            tenant = entry["tenant"]
-            events = entry["events"]
-            expected_count = entry["expected_count"]
-            expected_hash = entry["expected_hash"]
-            if not isinstance(events, list) or not events:
-                raise ValueError(
-                    "events must be a non-empty list, got "
-                    f"{events!r}"
-                )
-            _validate_json_value(tenant)
-            for event in events:
-                _validate_json_value(event)
-            _validate_required_count(expected_count)
-            _validate_expected_hash(expected_hash)
-            key = self._tenant_key(tenant)
-            if key in seen:
-                raise ValueError(
-                    f"duplicate tenant entry (same canonical JSON identity): "
-                    f"{tenant!r}"
-                )
-            seen.add(key)
-            norm.append((tenant, events, expected_count, expected_hash))
+            norm.append(_validate_many_heads_entry(entry, seen))
         if not norm:
             return []
         # One exclusive lease covers every involved chain's full scan, all
@@ -2165,6 +2183,77 @@ class AuditChain:
         # winner; every loser observes the winner's new tail inside the lease
         # and conflicts with that actual head.
         with self._heads_lease(norm, "append_many_if_heads") as f:
+            return self._append_many_if_heads_locked(f, norm)
+
+    def append_many_if_heads_stream(self, entries):
+        # Streaming counterpart of append_many_if_heads: the cross-tenant
+        # conditional entries arrive as a one-shot iterable consumed exactly
+        # once, in production order, instead of a materialized list. A bare
+        # bytes, bytearray or str is not an entry container (iterating it
+        # would yield ints or characters), a bare dict is one entry object
+        # rather than a group of them, and a non-iterable value is not a
+        # group either; all are caller errors and raise ValueError. The
+        # container shape is decided before any history read, path probe or
+        # commit begins. The iterator is pulled exactly once, and each
+        # produced member is validated as it arrives with the exact member
+        # boundary append_many_if_heads applies (object with exactly the
+        # keys tenant, events, expected_count and expected_hash; events a
+        # non-empty list; tenant and every event crossing the standard-JSON
+        # boundary; expected_count a non-negative plain int, bool rejected
+        # even though it subclasses int; expected_hash exactly 64 lowercase
+        # hex characters; a canonical JSON tenant identity at most once):
+        # the first invalid member stops the pull immediately and ends the
+        # call before a lease is taken, a path is probed or a single history
+        # byte is read. An exception the iterator raises before it finishes
+        # propagates verbatim (it is not wrapped in ValueError) and, like
+        # every other pre-lease failure, writes nothing -- the consumed
+        # prefix never reaches disk. An empty iterator is a no-op returning
+        # []: no file is created, no history is read and no byte changes.
+        if isinstance(entries, (bytes, bytearray, str, dict)):
+            raise ValueError(
+                "entries must be an iterable of entries, got a single "
+                f"{type(entries).__name__} object"
+            )
+        # The residual shape test is duck-typed: obtaining the iterator is
+        # also this entry's only pull on the container, so a non-iterable
+        # value ends as ValueError here while a valid iterator is not
+        # started until the container boundary has crossed.
+        try:
+            iterator = iter(entries)
+        except TypeError:
+            raise ValueError(
+                "entries must be an iterable of entries, got "
+                f"{type(entries).__name__}"
+            ) from None
+        # Materialize only after the container boundary has crossed: this is
+        # the single consumption of the iterator (it is never read again,
+        # inside or outside the lease), and each produced member is
+        # validated as it arrives, so a bad member -- or an iterator that
+        # raises -- ends the call before the lease and any history read.
+        norm = []
+        seen = set()
+        for entry in iterator:
+            norm.append(_validate_many_heads_entry(entry, seen))
+        if not norm:
+            return []
+        # Identical conditional indivisible commit as append_many_if_heads:
+        # one exclusive lease (the same _heads_lease rule: an existing log
+        # takes the data-file lease, a missing log is covered by the
+        # directory lease and may be created only when every assertion is
+        # the exact empty-chain head (0, ZERO), any other assertion being a
+        # deterministic conflict against actual (0, ZERO) that leaves no
+        # file) covers every involved chain's full scan, all head
+        # comparisons and the single block write. State errors take strict
+        # priority over conflicts, a corrupt involved chain raises
+        # AuditChainStateError (first physical line, then input order,
+        # deciding across chains; uninvolved tenants' damage is ignored)
+        # and the first mismatching assertion in production order raises
+        # AuditChainConflictError with the observed tail; neither failure
+        # path writes a byte. Serialization, hashing, seq numbering and the
+        # missing-newline prefix are exactly append_many_if_heads's, so the
+        # committed JSONL bytes are byte-for-byte what append_many_if_heads
+        # produces for the same entries over the same history.
+        with self._heads_lease(norm, "append_many_if_heads_stream") as f:
             return self._append_many_if_heads_locked(f, norm)
 
     def _verify_all_snapshot(self, data, with_hash=False):
